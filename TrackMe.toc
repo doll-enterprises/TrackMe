@@ -1,0 +1,8 @@
+## Interface: 120007
+## Title: TrackMe
+## Notes: Lightweight personal damage breakdown. Lists your (and your pets') spells by damage; click a spell for a crit/non-crit breakdown of casts, hits, and damage.
+## Author: doll94av
+## Version: 1.0.0
+## IconTexture: Interface\Icons\Ability_Warrior_Trauma
+
+TrackMe.lua
