@@ -122,4 +122,69 @@ assert mm.mine_guid == YOU, mm.mine_guid
 assert mm.me() == YOU, mm.me()            # MINE wins over the busier decoy
 assert mm.me_name == "Fordtruck", mm.me_name
 print("self-detect via MINE bit:", mm.me(), mm.me_name)
+
+
+# --------------------------------------------------------------------------
+# Fight history: a >5s gap (or ENCOUNTER_START) archives the finished fight
+# into meter.fights instead of discarding it.
+# --------------------------------------------------------------------------
+
+def at(secs, evline):
+    """Rewrite the timestamp seconds of a generated line."""
+    return evline.replace("00:15:35.123", f"00:15:{secs:06.3f}")
+
+
+mf = trackme.Meter()
+Y = "Player-8-YOU"
+# Fight 1: two hits on Dummy A, 1s apart.
+mf.feed(*trackme.parse_line(at(10.0, line("SPELL_DAMAGE", Y, "Me", "0x511", "133", "Fireball", "0x4", "0", 1000, False, "ST"))))
+mf.feed(*trackme.parse_line(at(11.0, line("SPELL_DAMAGE", Y, "Me", "0x511", "133", "Fireball", "0x4", "0", 2000, True, "ST"))))
+# >5s gap -> fight 1 archived, fight 2 begins.
+mf.feed(*trackme.parse_line(at(20.0, line("SPELL_DAMAGE", Y, "Me", "0x511", "116", "Frostbolt", "0x10", "0", 500, False, "ST"))))
+
+assert len(mf.fights) == 1, len(mf.fights)
+f1 = mf.fights[0]
+assert f1.total == 3000, f1.total
+assert f1.main_target() == "Dummy", f1.main_target()
+assert abs(f1.duration() - 1.0) < 0.01, f1.duration()
+assert mf.current.total == 500                      # fight 2 is the new current
+# The archived fight must be a DIFFERENT object than current (no aliasing).
+assert f1 is not mf.current
+# ENCOUNTER_START also archives (it has NO unit flags, so it must be handled
+# before the player/pet gate in feed()).
+mf.feed(*trackme.parse_line(
+    '7/13/2026 00:15:21.000-4  ENCOUNTER_START,2902,"Big Boss",8,5,2549'))
+assert len(mf.fights) == 2 and mf.fights[1].total == 500, len(mf.fights)
+assert mf.current.total == 0
+assert mf.current.encounter == "Big Boss"           # boss name stamped early
+print("fight history:", [(f.main_target(), f.total) for f in mf.fights])
+
+
+# --------------------------------------------------------------------------
+# Fight labels (zone > player) and deaths_during association.
+# --------------------------------------------------------------------------
+
+mz = trackme.Meter()
+mz.feed(*trackme.parse_line(
+    '7/13/2026 00:15:05.000-4  ZONE_CHANGE,1911,"Mugambala",0'))
+# Fight in Mugambala: 2 hits, and a player dies mid-fight.
+mz.feed(*trackme.parse_line(at(10.0, line("SPELL_DAMAGE", Y, "Me", "0x511", "133", "Fireball", "0x4", "0", 1000, False, "ST"))))
+mz.feed(*trackme.parse_line(incoming(11.000, "SPELL_DAMAGE", "Boss", VG, VNAME, "Smash", 9000, overkill=100, tag="ST")))
+mz.feed(*trackme.parse_line(unit_died(11.010, VG, VNAME)))
+mz.feed(*trackme.parse_line(at(12.0, line("SPELL_DAMAGE", Y, "Me", "0x511", "133", "Fireball", "0x4", "0", 1000, False, "ST"))))
+# Gap -> archive. Second fight elsewhere with no deaths.
+mz.feed(*trackme.parse_line(
+    '7/13/2026 00:15:20.000-4  ZONE_CHANGE,0,"Silvermoon City",0'))
+mz.feed(*trackme.parse_line(at(25.0, line("SPELL_DAMAGE", Y, "Me", "0x511", "116", "Frostbolt", "0x10", "0", 700, False, "ST"))))
+
+fz = mz.fights[0]
+assert fz.zone == "Mugambala" and fz.label() == "Mugambala", (fz.zone, fz.label())
+assert mz.current.zone == "Silvermoon City", mz.current.zone
+d_in = mz.deaths_during(fz)
+assert len(d_in) == 1 and d_in[0].name == VNAME, d_in
+assert mz.deaths_during(mz.current) == []           # no deaths in fight 2
+# Encounter label beats zone label.
+fz.encounter = "Raszageth"
+assert fz.label() == "Raszageth"
+print("zone label + deaths_during:", fz.zone, [d.name for d in d_in])
 print("ALL ASSERTIONS PASSED, total =", seg.total)

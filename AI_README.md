@@ -52,8 +52,31 @@ TrackMeUI._tick()        -> every 1s: poll, feed, redraw (Tk after-loop)
 - **TrackMeUI** is a single `tk.Canvas` drawn imperatively each tick. There are no
   widgets per row — everything is `create_rectangle`/`create_text`, and clicks
   are resolved against `self.click_regions` (y-band -> action). Navigation is
-  plain state: `tab` (damage/deaths), `view` (current/overall), `mode`
-  (list/detail), `detail_key`, `death_sel`.
+  plain state: `tab` (damage/fights/deaths), `view` (current/overall), `mode`
+  (list/detail), `detail_key`, `death_sel`, `fight_sel`.
+
+### UI design system (2026-07 overhaul)
+
+- **Palette** (constants at the top of the UI section): `BG` deep charcoal-blue,
+  `PANEL` bars, `CARD` row backgrounds, `TRACK` inputs/chips, `ACCENT` cyan
+  (`ACCENT_INK` for text on accent), `DANGER` red for deaths/overkill,
+  `CRIT_COLOR` gold — **crits are gold everywhere, always** (bars, numbers,
+  columns, timeline).
+- **Damage rows**: light text on `CARD` (never dark-on-bar), rank + name left,
+  mono damage + share right, and a **slim dual-segment bar**: school color =
+  non-crit share, gold = crit share of that spell's damage. Summary line shows
+  session crit%.
+- **Fonts**: Segoe UI Semibold (headers/`big`), Segoe UI (body), Cascadia Mono
+  fallback Consolas (`fixed`) — resolved at startup from `tkfont.families()`.
+- **Navigation**: underlined tab labels (`tab_widgets` label+indicator pairs),
+  segmented Current/Overall chips (damage tab only), full-width **breadcrumb**
+  bar in detail views (`_draw_crumb`, click = back), plus **Esc and right-click**
+  → `_go_back()`. Name field lives in the bottom status bar.
+- **Hover**: `_on_motion` draws an accent outline (tagged `"hover"`) over the
+  click region under the mouse + hand cursor — no full redraw; `_redraw`
+  restores it from `_mouse_y` since `delete("all")` wipes it.
+- **Dark title bar**: `_dark_titlebar()` via DWM attribute 20 (ctypes, guarded).
+- Death rows carry a 3px `DANGER` stripe on the left edge for identity.
 
 ## Who is "you"
 
@@ -93,6 +116,51 @@ Goal: for any player death, show ~5 s of the damage events that killed them.
 - Tunables live in Config: `DEATH_WINDOW` (5.0s), `INCOMING_CAP` (64),
   `DEATH_KEEP` (50). Deaths persist across fight resets but clear on
   `reset_all()` (Reset button / new session).
+
+## The Fights tab (per-combat history)
+
+When a fight ends (>`COMBAT_GAP` idle, or an `ENCOUNTER_START`), `Meter._end_fight()`
+**archives** the current `Segment` into `meter.fights` (`deque(maxlen=FIGHT_KEEP)`)
+instead of discarding it, then **replaces** `self.current` with a fresh Segment.
+Never call `current.reset()` on a segment that was archived — `reset()` mutates in
+place and would corrupt the history; replacement is the invariant.
+
+- Fights are labeled by `Segment.label()`: **encounter name** (boss pull) >
+  **zone** (tracked from `ZONE_CHANGE`, stamped onto the fight in `_advance`) >
+  `main_target()` as last resort. The main target still shows as a "vs …"
+  subtitle.
+- UI: a native `tk.OptionMenu` **dropdown** (`self.fightbar`, packed only on the
+  Fights tab via `before=self.lbl_summary`) selects the fight — newest first,
+  defaulting to the newest. The canvas below shows the combined
+  `_draw_fight_view`: header, **deaths that happened during the fight**
+  (`Meter.deaths_during(seg)`, fight span + COMBAT_GAP grace tail; rows click
+  into the death timeline), then the spell breakdown. Spell detail and death
+  detail both Back into the fight view.
+- The dropdown menu is rebuilt only when the history actually changes
+  (`_fights_sig` identity signature) — don't rebuild per tick.
+- **Selection state holds objects, never deque indices** (`fight_sel` = Segment,
+  `death_sel` = DeathRecord): deque eviction shifts indices and silently switches
+  records. Both self-heal to a sensible view if the object is evicted/wiped.
+
+## Settings persistence, theming & window behavior
+
+`trackme_settings.json` (next to the script, gitignored) stores `name`,
+`geometry`, `log_path`, `pin`, `colors`. Saved on window close and immediately
+on any color change (`_save_settings_now`), loaded in `main()`; **CLI args
+always win over saved settings.** "Pin" toggles `root.attributes("-topmost")`.
+
+**Theming:** the palette globals (`BG`, `ACCENT`, `CRIT_COLOR`, …) are
+user-editable via the **Settings tab**. `THEME` maps global name → (label,
+default); `apply_theme()` rebinds the module globals (validating `#rrggbb`, so a
+hand-edited settings file can't break startup). Canvas drawings pick the new
+values up on the next redraw automatically; **static widgets don't** — they're
+registered at build time via `_reg(widget, opt="GLOBALNAME")` into
+`self._styled`, and `_restyle_widgets()` re-applies the palette to all of them
+after a change. If you add a new tk widget with themed colors, register it with
+`_reg` or it will keep its old colors after a palette change. Color rows use the
+native `tkinter.colorchooser` dialog; a reset row restores `default_colors()`.
+The character-name entry lives on the Settings tab, embedded in the canvas via
+`create_window` (`_make_name_entry`, lazy since it needs the canvas).
 
 ## Combat-log field layout (Midnight 12.0.7, advanced logging on)
 
@@ -135,7 +203,20 @@ These are verified against a real log — don't "fix" them back to textbook valu
 7. **Incoming damage uses `destFlags` (`fields[7]`), not `srcFlags`.** The Damage
    tab keys off `srcFlags`; the Deaths tab keys off `destFlags`. Don't cross them.
 8. **Live latency is ~1-2s and is a WoW client behavior** — the game flushes the
-   log in bursts. Not an app bug; don't chase it.
+   log in bursts. Worse: WoW only writes **while combat events are being
+   generated** — if you die and sit dead, your death isn't flushed until combat
+   resumes. Not an app bug; don't chase it.
+10. **`ENCOUNTER_START`, `ZONE_CHANGE` (and other non-unit events) have NO unit
+   flags** — `fields[3]` is difficultyID/whatever, so any handler placed after
+   the `flags & TYPE_PLAYER / PET_MASK` gate in `feed()` is **unreachable**.
+   This exact bug shipped: the old encounter-reset branch never fired. Handle
+   non-unit events early, next to `UNIT_DIED`. Formats (verified):
+   `ZONE_CHANGE,zoneID,"Zone Name",difficultyID` and
+   `ENCOUNTER_START,encID,"Boss Name",difficultyID,groupSize,instanceID` —
+   name at `fields[2]` in both.
+11. **Never `reset()` a Segment that may be archived in `meter.fights`** —
+   `reset()` mutates in place via `__init__`; replace the object instead
+   (`self.current = Segment()`).
 9. **Environment note (not a code trap):** on this user's install, merely
    registering combat-log events surfaced a Blizzard Edit Mode
    `BT4BarExtraActionBar SetPoint` error caused by a stale Bartender4 anchor in

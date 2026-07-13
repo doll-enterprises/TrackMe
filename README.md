@@ -41,8 +41,21 @@ WoW still writes the full detail to disk via `/combatlog`
 
 ## Using it
 
-- The main window lists your (and your pets') spells by damage, sorted, with a
-  bar, total, and % — pet rows are tagged `(pet)`.
+- The main window lists your (and your pets') spells by damage, sorted — each
+  row's bar is split by color: **spell-school color for normal damage, gold for
+  the crit share**. Crits are gold everywhere in the app.
+- **Go back** from any detail view three ways: click the breadcrumb bar at the
+  top, press **Esc**, or **right-click**.
+- **Tabs:** **Damage** (live breakdown), **Fights** (pick any finished fight
+  from the dropdown — named by boss/zone — to see its spell breakdown plus any
+  deaths that happened during it; a fight ends after ~5s out of combat or on a
+  boss pull), and **Deaths** (any group player's death with the last 5s of
+  damage they took).
+- **Pin** keeps the window on top of WoW. Your name, window size/position, pin
+  state, and colors are remembered between launches (`trackme_settings.json`).
+- **Settings tab** — set your character name (blank = auto-detect) and
+  customize the app's colors: click any color row to open a picker (accent,
+  crit gold, background, rows, text, and more), or reset to the defaults.
 - **You:** field — leave blank to auto-detect (the most active player in the log),
   or type your character name to lock onto it. Changing it re-scans instantly.
 - **Click a spell** to open a detail window: casts, hits, crit rate, total, DPS,

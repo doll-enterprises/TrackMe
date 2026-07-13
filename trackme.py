@@ -21,6 +21,7 @@ in a group.
 
 import csv
 import glob
+import json
 import os
 import re
 import sys
@@ -29,6 +30,7 @@ from collections import Counter, deque
 from datetime import datetime
 
 import tkinter as tk
+from tkinter import colorchooser
 from tkinter import font as tkfont
 
 # --------------------------------------------------------------------------
@@ -52,6 +54,29 @@ DEATH_WINDOW = 5.0    # seconds of incoming damage kept before a death
 INCOMING_CAP = 64     # incoming hits buffered per player (bounds memory)
 DEATH_KEEP = 50       # death records retained for the Deaths tab
 
+FIGHT_KEEP = 50       # finished fights retained for the Fights tab
+
+# Saved UI settings (character name, window geometry, log path, pin state).
+SETTINGS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "trackme_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(data):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass          # e.g. read-only folder; settings are a nicety, not vital
+
 # Combat-log object-flag bits.
 AFFILIATION_MINE = 0x00000001  # set by WoW on the logging character (and its pets)
 TYPE_PLAYER   = 0x00000400
@@ -69,16 +94,16 @@ DAMAGE_EVENTS = {
 }
 
 SCHOOL_COLORS = {
-    1:  "#e6cc80",  # Physical
-    2:  "#fff2b3",  # Holy
-    4:  "#ff8033",  # Fire
-    8:  "#4dff4d",  # Nature
-    16: "#80e5ff",  # Frost
-    32: "#8c66ff",  # Shadow
-    64: "#e680ff",  # Arcane
+    1:  "#d9b96a",  # Physical
+    2:  "#f4e6a8",  # Holy
+    4:  "#ff7847",  # Fire
+    8:  "#59d97a",  # Nature
+    16: "#5cc8f2",  # Frost
+    32: "#9b7bff",  # Shadow
+    64: "#e879e8",  # Arcane
 }
-DEFAULT_COLOR = "#8f99e6"
-PET_COLOR     = "#59d1d9"
+DEFAULT_COLOR = "#7f8dd9"
+PET_COLOR     = "#4ecfc4"
 
 # --------------------------------------------------------------------------
 # Parsing
@@ -196,6 +221,9 @@ class Segment:
         self.active_time = 0.0
         self.first_ts = None
         self.last_ts = None
+        self.targets = Counter()   # target name -> damage dealt
+        self.zone = None           # zone the fight happened in (ZONE_CHANGE)
+        self.encounter = None      # boss name if it was a pull (ENCOUNTER_START)
 
     def reset(self):
         self.__init__()
@@ -221,6 +249,20 @@ class Segment:
     def record(self, key, name, spell_id, is_pet, school, amount, crit, ts, target):
         self._rec(key, name, spell_id, is_pet, school).add_damage(amount, crit, ts, target)
         self.total += amount
+        if target:
+            self.targets[target] += amount
+
+    def main_target(self):
+        return self.targets.most_common(1)[0][0] if self.targets else "Unknown"
+
+    def label(self):
+        """Fight name: boss pull > zone > main target (last resort)."""
+        return self.encounter or self.zone or self.main_target()
+
+    def duration(self):
+        if self.first_ts is None or self.last_ts is None:
+            return 0.0
+        return self.last_ts - self.first_ts
 
     def record_cast(self, key, name, spell_id, is_pet, school):
         self._rec(key, name, spell_id, is_pet, school).casts += 1
@@ -246,15 +288,19 @@ class Meter:
         self._locked_guid = None
         self.mine_guid = None            # player GUID flagged AFFILIATION_MINE (0x1)
         self.me_name = None
+        self.zone = None                 # current zone name (from ZONE_CHANGE)
         # Death tracking (for ALL players, not just "you").
         self.incoming = {}               # player-GUID -> deque of recent hits taken
         self.deaths = deque(maxlen=DEATH_KEEP)
+        # Finished fights, oldest -> newest (Fights tab history).
+        self.fights = deque(maxlen=FIGHT_KEEP)
 
     def reset_all(self):
-        self.current.reset()
-        self.overall.reset()
+        self.current = Segment()
+        self.overall = Segment()
         self.incoming.clear()
         self.deaths.clear()
+        self.fights.clear()
 
     def me(self):
         """The GUID we attribute damage to.
@@ -300,8 +346,19 @@ class Meter:
 
         # Death tracking runs for every player (not just "you") and before the
         # "is this my damage?" gate below, so it sees the whole group.
+        # Non-unit events have no unit flags in fields[3], so they must be
+        # handled BEFORE the player/pet flag gate below (it would drop them).
         if event == "UNIT_DIED":
             self._note_death(ts, fields)
+            return
+        if event == "ZONE_CHANGE":       # ZONE_CHANGE,zoneID,"Zone Name",diff
+            if len(fields) > 2 and fields[2]:
+                self.zone = fields[2]
+            return
+        if event == "ENCOUNTER_START":   # ENCOUNTER_START,id,"Boss Name",...
+            self._end_fight()
+            if len(fields) > 2 and fields[2]:
+                self.current.encounter = fields[2]
             return
         self._track_incoming(ts, event, fields)
 
@@ -360,14 +417,32 @@ class Meter:
             self.current.record_cast(key, spell_name, spell_id, is_pet, school)
             self.overall.record_cast(key, spell_name, spell_id, is_pet, school)
 
-        elif event == "ENCOUNTER_START":
-            self.current.reset()
+    def _end_fight(self):
+        """Archive the current fight into history (if it saw damage) and start fresh.
+
+        NOTE: we REPLACE self.current rather than reset it in place — the old
+        Segment object lives on inside self.fights, so mutating it would corrupt
+        the archived history.
+        """
+        if self.current.total > 0:
+            self.fights.append(self.current)
+        self.current = Segment()
 
     def _advance(self, ts):
         if self.current.last_ts is not None and (ts - self.current.last_ts) > COMBAT_GAP:
-            self.current.reset()
+            self._end_fight()
+        if self.current.zone is None and self.zone:
+            self.current.zone = self.zone     # stamp where the fight happens
         self.current.note_time(ts)
         self.overall.note_time(ts)
+
+    def deaths_during(self, seg):
+        """Deaths that happened inside this fight (with a grace tail: you can
+        die moments after your own last damage event)."""
+        if seg.first_ts is None:
+            return []
+        end = (seg.last_ts or seg.first_ts) + COMBAT_GAP
+        return [d for d in self.deaths if seg.first_ts <= d.ts <= end]
 
     # -- death tracking -------------------------------------------------------
 
@@ -480,12 +555,50 @@ class Tailer:
 # UI
 # --------------------------------------------------------------------------
 
-BG      = "#14141a"
-PANEL   = "#1d1d26"
-TRACK   = "#26262f"
-TEXT    = "#e8e8ee"
-SUBTEXT = "#9aa0ad"
-ACCENT  = "#66ccff"
+BG      = "#0e1118"   # window background (deep charcoal-blue)
+PANEL   = "#151a24"   # header / status / breadcrumb bars
+CARD    = "#171c28"   # list-row cards
+TRACK   = "#212836"   # inputs, chips, inactive controls
+TEXT    = "#e9ecf4"
+SUBTEXT = "#7e8698"
+ACCENT  = "#59d1ff"   # electric cyan
+ACCENT_INK = "#0b0e14"  # text drawn ON an accent background
+DANGER  = "#ff6b7a"   # deaths / overkill
+CRIT_COLOR = "#ffc75c"  # crits are ALWAYS this gold, everywhere
+
+# User-themable colors (Settings tab): global name -> (label, default).
+# apply_theme() rebinds the module-level names above; the canvas reads them
+# live on every redraw, and _restyle_widgets() refreshes the static widgets.
+THEME = {
+    "ACCENT":     ("Accent", ACCENT),
+    "CRIT_COLOR": ("Crit gold", CRIT_COLOR),
+    "DANGER":     ("Deaths / overkill", DANGER),
+    "PET_COLOR":  ("Pet bars", PET_COLOR),
+    "TEXT":       ("Text", TEXT),
+    "SUBTEXT":    ("Muted text", SUBTEXT),
+    "BG":         ("Background", BG),
+    "PANEL":      ("Panels", PANEL),
+    "CARD":       ("Rows", CARD),
+    "TRACK":      ("Inputs / chips", TRACK),
+}
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def apply_theme(overrides):
+    """Rebind the palette globals from a {name: '#rrggbb'} dict (bad values
+    and unknown keys are ignored, so a hand-edited settings file can't break
+    the app)."""
+    for key, val in (overrides or {}).items():
+        if key in THEME and isinstance(val, str) and HEX_RE.match(val):
+            globals()[key] = val
+
+
+def current_colors():
+    return {key: globals()[key] for key in THEME}
+
+
+def default_colors():
+    return {key: default for key, (_label, default) in THEME.items()}
 
 
 def abbrev(n):
@@ -501,99 +614,252 @@ def commas(n):
     return f"{int(round(n or 0)):,}"
 
 
-CRIT_COLOR = "#ffcc66"
+def fmt_dur(seconds):
+    s = max(0, int(round(seconds or 0)))
+    return f"{s // 60}:{s % 60:02d}"
 
 
 class TrackMeUI:
-    def __init__(self, log_path, forced_name=None):
+    def __init__(self, log_path, forced_name=None, settings=None):
         self.meter = Meter(forced_name)
         self.tailer = Tailer(log_path)
-        self.tab = "damage"         # "damage" | "deaths"
+        self.settings = settings or {}
+        self.tab = "damage"         # "damage" | "deaths" | "fights"
         self.view = "current"
         self.mode = "list"          # "list" | "detail"
         self.detail_key = None
-        self.death_sel = None       # index into meter.deaths when viewing one
+        self.death_sel = None       # DeathRecord OBJECT being viewed (never an
+                                    # index: deque eviction shifts indices)
+        self.fight_sel = None       # Segment OBJECT from meter.fights (same rule)
+        self.pin_on = False
         self.click_regions = []     # (y0, y1, (action, value)) in canvas coords
 
         self.root = tk.Tk()
         self.root.title("TrackMe - live combat-log breakdown")
         self.root.configure(bg=BG)
-        self.root.geometry("440x600")
+        self.root.geometry(self.settings.get("geometry") or "440x600")
         self.root.minsize(360, 340)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._dark_titlebar()
 
-        self.fixed = tkfont.Font(family="Consolas", size=9)
-        self.bold = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        # Fonts, with graceful fallbacks for older Windows installs.
+        fams = set(tkfont.families())
+        mono = "Cascadia Mono" if "Cascadia Mono" in fams else "Consolas"
+        semi = "Segoe UI Semibold" if "Segoe UI Semibold" in fams else "Segoe UI"
+        semi_w = "normal" if semi == "Segoe UI Semibold" else "bold"
+        self.fixed = tkfont.Font(family=mono, size=9)
+        self.body = tkfont.Font(family="Segoe UI", size=9)
         self.small = tkfont.Font(family="Segoe UI", size=8)
+        self.bold = tkfont.Font(family=semi, size=10, weight=semi_w)
+        self.big = tkfont.Font(family=semi, size=13, weight=semi_w)
+
+        self._hover = None          # (y0, y1) of the click region under the mouse
+        self._mouse_y = None        # last mouse y (canvas coords), for re-hover
 
         self._build_header()
+        self._build_statusbar()
         if forced_name:
             self.name_var.set(forced_name)
+        if self.settings.get("pin"):
+            self._toggle_pin()
 
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True, padx=6, pady=2)
+        self.canvas.pack(fill="both", expand=True, padx=8, pady=(2, 4))
         self.canvas.bind("<Button-1>", self._on_click)
         self.canvas.bind("<Configure>", lambda e: self._redraw())
         self.canvas.bind("<MouseWheel>", self._on_wheel)
-
-        self.lbl_status = tk.Label(self.root, text="", fg=SUBTEXT, bg=PANEL,
-                                   anchor="w", font=self.small)
-        self.lbl_status.pack(fill="x", side="bottom")
+        self.canvas.bind("<Motion>", self._on_motion)
+        self.canvas.bind("<Leave>", lambda e: self._set_hover(None))
+        # Two extra ways back besides the breadcrumb: right-click and Escape.
+        self.canvas.bind("<Button-3>", lambda e: self._go_back())
+        self.root.bind("<Escape>", lambda e: self._go_back())
 
         self.root.after(200, self._tick)
 
+    def _dark_titlebar(self):
+        """Ask DWM for a dark title bar so it matches the app (Win10 1809+)."""
+        try:
+            import ctypes
+            self.root.update_idletasks()
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            value = ctypes.c_int(1)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+        except Exception:
+            pass                      # cosmetic only; never block startup
+
     # -- header ---------------------------------------------------------------
 
+    def _reg(self, widget, **opts):
+        """Register a widget's theme-driven options (opt -> THEME/global name)
+        so _restyle_widgets() can re-apply them after a color change."""
+        self._styled.append((widget, opts))
+        widget.config(**{opt: globals()[key] for opt, key in opts.items()})
+
     def _build_header(self):
-        top = tk.Frame(self.root, bg=PANEL)
+        self._styled = []
+        top = tk.Frame(self.root)
         top.pack(fill="x", side="top")
-        tk.Label(top, text="TrackMe", fg=ACCENT, bg=PANEL,
-                 font=self.bold).pack(side="left", padx=8, pady=6)
-        self.btn_view = tk.Button(top, text="Overall", width=8, relief="flat",
-                                  bg=TRACK, fg=TEXT, activebackground=ACCENT,
-                                  command=self._toggle_view)
-        self.btn_view.pack(side="right", padx=6, pady=6)
-        tk.Button(top, text="Reset", width=6, relief="flat", bg=TRACK, fg=TEXT,
-                  activebackground="#a44", command=self._reset).pack(side="right", pady=6)
+        self._reg(top, bg="PANEL")
+        title = tk.Label(top, text="TrackMe", font=self.big)
+        title.pack(side="left", padx=10, pady=6)
+        self._reg(title, bg="PANEL", fg="ACCENT")
+        btn_reset = tk.Button(top, text="Reset", relief="flat", bd=0,
+                              font=self.small, cursor="hand2",
+                              command=self._reset)
+        btn_reset.pack(side="right", padx=(0, 10), pady=6)
+        self._reg(btn_reset, bg="PANEL", fg="SUBTEXT",
+                  activebackground="TRACK", activeforeground="DANGER")
+        self.btn_pin = tk.Button(top, text="Pin", relief="flat", bd=0,
+                                 font=self.small, cursor="hand2",
+                                 command=self._toggle_pin)
+        self.btn_pin.pack(side="right", padx=6, pady=6)
+        self._reg(self.btn_pin, bg="PANEL",
+                  activebackground="TRACK", activeforeground="ACCENT")
+        self.btn_pin.config(fg=SUBTEXT)   # fg is pin-state dependent
 
-        namebar = tk.Frame(self.root, bg=BG)
-        namebar.pack(fill="x", padx=8, pady=(4, 0))
-        tk.Label(namebar, text="You:", fg=SUBTEXT, bg=BG,
-                 font=self.small).pack(side="left")
+        # Tab bar: text + accent underline, view toggle on the right.
+        tabbar = tk.Frame(self.root)
+        tabbar.pack(fill="x", padx=8, pady=(6, 0))
+        self._reg(tabbar, bg="BG")
+        self.tab_widgets = {}
+        for name, label in (("damage", "Damage"), ("fights", "Fights"),
+                            ("deaths", "Deaths"), ("settings", "Settings")):
+            wrap = tk.Frame(tabbar)
+            wrap.pack(side="left", padx=(0, 2))
+            self._reg(wrap, bg="BG")
+            lbl = tk.Label(wrap, text=label, font=self.bold,
+                           padx=10, pady=3, cursor="hand2")
+            lbl.pack()
+            self._reg(lbl, bg="BG")
+            ind = tk.Frame(wrap, height=2)
+            ind.pack(fill="x", padx=6)
+            lbl.bind("<Button-1>", lambda e, n=name: self._set_tab(n))
+            self.tab_widgets[name] = (lbl, ind)
+
+        self.view_seg = tk.Frame(tabbar)
+        self._reg(self.view_seg, bg="TRACK")
+        self.view_labels = {}
+        for v, txt in (("current", "Current"), ("overall", "Overall")):
+            lbl = tk.Label(self.view_seg, text=txt, font=self.small,
+                           padx=9, pady=2, cursor="hand2")
+            lbl.pack(side="left")
+            lbl.bind("<Button-1>", lambda e, vv=v: self._set_view(vv))
+            self.view_labels[v] = lbl
+
+        self.lbl_summary = tk.Label(self.root, text="", anchor="w",
+                                    font=self.bold)
+        self.lbl_summary.pack(fill="x", padx=10, pady=(4, 2))
+        self._reg(self.lbl_summary, bg="BG", fg="TEXT")
+
+        # Fight selector (dropdown) - only shown on the Fights tab.
+        self.fightbar = tk.Frame(self.root)
+        self._reg(self.fightbar, bg="BG")
+        lbl_fight = tk.Label(self.fightbar, text="Fight:", font=self.small)
+        lbl_fight.pack(side="left")
+        self._reg(lbl_fight, bg="BG", fg="SUBTEXT")
+        self.fight_var = tk.StringVar(value="")
+        self.fight_menu = tk.OptionMenu(self.fightbar, self.fight_var, "")
+        self.fight_menu.config(relief="flat", highlightthickness=0,
+                               anchor="w", font=self.small)
+        self._reg(self.fight_menu, bg="TRACK", fg="TEXT",
+                  activebackground="ACCENT", activeforeground="ACCENT_INK")
+        self.fight_menu["menu"].config(font=self.small)
+        self._reg(self.fight_menu["menu"], bg="PANEL", fg="TEXT",
+                  activebackground="ACCENT", activeforeground="ACCENT_INK")
+        self.fight_menu.pack(side="left", fill="x", expand=True, padx=4)
+        self._fight_items = []        # [(label, Segment)] newest first
+        self._fights_sig = None       # change-detector for menu rebuilds
+
+        # Character-name entry: created once, embedded in the canvas by the
+        # Settings tab (create_window).
         self.name_var = tk.StringVar()
-        entry = tk.Entry(namebar, textvariable=self.name_var, bg=TRACK, fg=TEXT,
-                         insertbackground=TEXT, relief="flat", font=self.small, width=16)
-        entry.pack(side="left", padx=4)
-        entry.bind("<Return>", self._apply_name)
-        entry.bind("<FocusOut>", self._apply_name)
-        tk.Label(namebar, text="(blank = auto)", fg=SUBTEXT, bg=BG,
-                 font=self.small).pack(side="left", padx=2)
+        self.name_entry = None        # created lazily (needs the canvas)
+        self._style_tabs()
 
-        tabbar = tk.Frame(self.root, bg=BG)
-        tabbar.pack(fill="x", padx=8, pady=(4, 0))
-        self.btn_dmg = tk.Button(tabbar, text="Damage", width=8, relief="flat",
-                                 bg=ACCENT, fg="#101014",
-                                 command=lambda: self._set_tab("damage"))
-        self.btn_dmg.pack(side="left", padx=(0, 4))
-        self.btn_deaths = tk.Button(tabbar, text="Deaths", width=8, relief="flat",
-                                    bg=TRACK, fg=TEXT,
-                                    command=lambda: self._set_tab("deaths"))
-        self.btn_deaths.pack(side="left")
+    def _make_name_entry(self):
+        if self.name_entry is None:
+            self.name_entry = tk.Entry(self.canvas, textvariable=self.name_var,
+                                       relief="flat", font=self.body, width=20)
+            self._reg(self.name_entry, bg="TRACK", fg="TEXT",
+                      insertbackground="TEXT")
+            self.name_entry.bind("<Return>", self._apply_name)
+            self.name_entry.bind("<FocusOut>", self._apply_name)
+        return self.name_entry
 
-        self.lbl_summary = tk.Label(self.root, text="", fg=TEXT, bg=BG,
-                                    anchor="w", font=self.small)
-        self.lbl_summary.pack(fill="x", padx=8, pady=(2, 2))
+    def _build_statusbar(self):
+        bar = tk.Frame(self.root)
+        bar.pack(fill="x", side="bottom")
+        self._reg(bar, bg="PANEL")
+        self.lbl_status = tk.Label(bar, text="", anchor="w", font=self.small)
+        self.lbl_status.pack(side="left", fill="x", expand=True, padx=8, pady=2)
+        self._reg(self.lbl_status, bg="PANEL", fg="SUBTEXT")
+
+    def _restyle_widgets(self):
+        """Re-apply the (possibly changed) palette to every static widget."""
+        self.root.configure(bg=BG)
+        self.canvas.config(bg=BG)
+        for widget, opts in self._styled:
+            widget.config(**{opt: globals()[key] for opt, key in opts.items()})
+        self._style_tabs()
+        self.btn_pin.config(fg=ACCENT if self.pin_on else SUBTEXT)
+
+    def _style_tabs(self):
+        for name, (lbl, ind) in self.tab_widgets.items():
+            active = name == self.tab
+            lbl.config(fg=TEXT if active else SUBTEXT)
+            ind.config(bg=ACCENT if active else BG)
+        # Current/Overall only applies to the Damage tab.
+        if self.tab == "damage":
+            self.view_seg.pack(side="right", pady=2)
+            self._style_view()
+        else:
+            self.view_seg.pack_forget()
+
+    def _style_view(self):
+        for v, lbl in self.view_labels.items():
+            active = v == self.view
+            lbl.config(bg=ACCENT if active else TRACK,
+                       fg=ACCENT_INK if active else SUBTEXT)
+
+    def _set_view(self, view):
+        if view == self.view:
+            return
+        self.view = view
+        self._style_view()
+        self._redraw()
 
     def _set_tab(self, tab):
         self.tab = tab
         self.mode, self.detail_key = "list", None
         self.death_sel = None
-        on, off = (ACCENT, "#101014"), (TRACK, TEXT)
-        self.btn_dmg.config(bg=(on if tab == "damage" else off)[0],
-                            fg=(on if tab == "damage" else off)[1])
-        self.btn_deaths.config(bg=(on if tab == "deaths" else off)[0],
-                               fg=(on if tab == "deaths" else off)[1])
+        self.fight_sel = None
+        self._style_tabs()
+        if tab == "fights":
+            self.fightbar.pack(fill="x", padx=8, pady=(0, 2),
+                               before=self.lbl_summary)
+        else:
+            self.fightbar.pack_forget()
         self.canvas.yview_moveto(0)
         self._redraw()
+
+    def _toggle_pin(self):
+        self.pin_on = not self.pin_on
+        self.root.attributes("-topmost", self.pin_on)
+        self.btn_pin.config(fg=ACCENT if self.pin_on else SUBTEXT)
+
+    def _save_settings_now(self):
+        save_settings({
+            "name": self.name_var.get().strip(),
+            "geometry": self.root.geometry(),
+            "log_path": self.tailer.given,
+            "pin": self.pin_on,
+            "colors": current_colors(),
+        })
+
+    def _on_close(self):
+        self._save_settings_now()
+        self.root.destroy()
 
     def _apply_name(self, *_):
         name = self.name_var.get().strip()
@@ -604,6 +870,8 @@ class TrackMeUI:
         self.tailer.pos = None
         self.tailer.buffer = ""
         self.mode, self.detail_key = "list", None
+        self.death_sel = None
+        self.fight_sel = None             # old Segment belongs to the old meter
         self._redraw()
 
     # -- navigation / events --------------------------------------------------
@@ -611,14 +879,22 @@ class TrackMeUI:
     def _segment(self):
         return self.meter.overall if self.view == "overall" else self.meter.current
 
-    def _toggle_view(self):
-        self.view = "overall" if self.view == "current" else "current"
-        self.btn_view.config(text="Current" if self.view == "overall" else "Overall")
+    def _go_back(self):
+        """One level up: Esc / right-click / breadcrumb all land here."""
+        if self.death_sel is not None:
+            self.death_sel = None
+        elif self.mode == "detail":
+            self.mode, self.detail_key = "list", None
+        else:
+            return
+        self.canvas.yview_moveto(0)
         self._redraw()
 
     def _reset(self):
         self.meter.reset_all()
         self.mode, self.detail_key = "list", None
+        self.death_sel = None
+        self.fight_sel = None
         self.canvas.yview_moveto(0)
         self._redraw()
 
@@ -632,6 +908,31 @@ class TrackMeUI:
             return
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
+    def _region_at(self, y):
+        for y0, y1, act in self.click_regions:
+            if y0 <= y <= y1:
+                return (y0, y1, act)
+        return None
+
+    def _set_hover(self, band):
+        """Draw/clear the hover outline without a full canvas redraw."""
+        if band == self._hover:
+            return
+        self._hover = band
+        self.canvas.delete("hover")
+        if band:
+            w = self.canvas.winfo_width()
+            self.canvas.create_rectangle(1, band[0], w - 2, band[1],
+                                         outline=ACCENT, width=1, tags="hover")
+            self.canvas.config(cursor="hand2")
+        else:
+            self.canvas.config(cursor="")
+
+    def _on_motion(self, event):
+        self._mouse_y = self.canvas.canvasy(event.y)
+        hit = self._region_at(self._mouse_y)
+        self._set_hover((hit[0], hit[1]) if hit else None)
+
     def _on_click(self, event):
         y = self.canvas.canvasy(event.y)
         for y0, y1, (action, value) in self.click_regions:
@@ -640,10 +941,14 @@ class TrackMeUI:
                     self.mode, self.detail_key = "detail", value
                 elif action == "back":
                     self.mode, self.detail_key = "list", None
-                elif action == "death":
+                elif action == "death":          # value is the DeathRecord
                     self.death_sel = value
                 elif action == "dback":
                     self.death_sel = None
+                elif action == "color":          # value is a THEME key
+                    self._pick_color(value)
+                elif action == "colreset":
+                    self._reset_colors()
                 self.canvas.yview_moveto(0)
                 self._redraw()
                 return
@@ -681,17 +986,27 @@ class TrackMeUI:
         c.delete("all")
         self.click_regions = []
 
-        if self.tab == "deaths":
+        if self.tab == "settings":
+            self.lbl_summary.config(text="Settings")
+            self._draw_settings()
+        elif self.tab == "deaths":
             self.lbl_summary.config(
                 text=f"Deaths this session: {len(self.meter.deaths)}")
             if self.death_sel is not None:
                 self._draw_death_detail()
             else:
                 self._draw_death_list()
+        elif self.tab == "fights":
+            self._redraw_fights()
         else:
-            self.lbl_summary.config(
-                text=f"{'Overall' if self.view == 'overall' else 'Current fight'}"
-                     f"    {commas(seg.total)}    {abbrev(seg.dps())} DPS")
+            summary = f"{commas(seg.total)}   ·   {abbrev(seg.dps())} DPS"
+            if seg.total:
+                crit_total = sum(r.c_total for r in seg.spells.values())
+                summary += f"   ·   {crit_total / seg.total * 100:.0f}% crit"
+            # Live fight timer while the current fight has data.
+            if self.view == "current" and seg.duration() > 0:
+                summary += f"   ·   {fmt_dur(seg.duration())}"
+            self.lbl_summary.config(text=summary)
             if self.mode == "detail" and self.detail_key:
                 self._draw_detail(seg)
             else:
@@ -709,50 +1024,86 @@ class TrackMeUI:
         else:
             c.configure(scrollregion=(0, 0, 0, 0))
 
-    def _draw_list(self, seg):
+        # The redraw wiped the hover outline; restore it from the last mouse pos.
+        self._hover = None
+        if self._mouse_y is not None:
+            hit = self._region_at(self._mouse_y)
+            self._set_hover((hit[0], hit[1]) if hit else None)
+
+    def _draw_list(self, seg, y0=2):
         c = self.canvas
         rows = seg.sorted_spells()
         if not rows:
-            c.create_text(12, 14, anchor="w", fill=SUBTEXT, font=self.small,
+            c.create_text(12, y0 + 12, anchor="w", fill=SUBTEXT, font=self.small,
                           text="No damage yet. Ensure /combatlog is on, then fight.")
             return
         width = c.winfo_width() or 420
         top_total = rows[0].total
-        row_h = 22
-        y = 2
+        row_h = 30
+        y = y0
         for i, r in enumerate(rows[:MAX_ROWS]):
             frac = (r.total / top_total) if top_total else 0
             color = PET_COLOR if r.is_pet else SCHOOL_COLORS.get(r.school, DEFAULT_COLOR)
-            c.create_rectangle(0, y, width, y + row_h - 2, fill=TRACK, outline="")
-            c.create_rectangle(0, y, max(2, width * frac), y + row_h - 2, fill=color, outline="")
             pct = (r.total / seg.total * 100) if seg.total else 0
-            name = f"{i + 1}. {r.name}" + ("  (pet)" if r.is_pet else "")
-            c.create_text(6, y + (row_h - 2) / 2, anchor="w", fill="#101014",
-                          font=self.fixed, text=name)
-            c.create_text(width - 6, y + (row_h - 2) / 2, anchor="e", fill="#101014",
-                          font=self.fixed, text=f"{abbrev(r.total)}  {pct:.0f}%")
-            self.click_regions.append((y, y + row_h - 2, ("select", r.key)))
+
+            c.create_rectangle(0, y, width, y + row_h - 4, fill=CARD, outline="")
+            # Rank + name in light text (always readable, whatever the bar does).
+            c.create_text(10, y + 9, anchor="w", fill=SUBTEXT, font=self.small,
+                          text=str(i + 1))
+            c.create_text(28, y + 9, anchor="w", fill=TEXT, font=self.body,
+                          text=r.name + ("  (pet)" if r.is_pet else ""))
+            # Right-aligned numbers: damage (mono) then share of total.
+            c.create_text(width - 10, y + 9, anchor="e", fill=SUBTEXT,
+                          font=self.small, text=f"{pct:.0f}%")
+            c.create_text(width - 48, y + 9, anchor="e", fill=TEXT,
+                          font=self.fixed, text=abbrev(r.total))
+            # Slim bar: school color for non-crit damage, GOLD for the crit share.
+            bar_w = max(2, (width - 20) * frac)
+            crit_frac = (r.c_total / r.total) if r.total else 0
+            split = 10 + bar_w * (1 - crit_frac)
+            yb0, yb1 = y + row_h - 10, y + row_h - 6
+            if split > 10:
+                c.create_rectangle(10, yb0, split, yb1, fill=color, outline="")
+            if crit_frac > 0:
+                c.create_rectangle(split, yb0, 10 + bar_w, yb1,
+                                   fill=CRIT_COLOR, outline="")
+            self.click_regions.append((y, y + row_h - 4, ("select", r.key)))
             y += row_h
+
+    def _draw_crumb(self, action, parent, here):
+        """Full-width breadcrumb bar: '‹ parent / here'. Click = back.
+        Returns the y where content starts."""
+        c = self.canvas
+        width = c.winfo_width() or 420
+        c.create_rectangle(0, 0, width, 26, fill=PANEL, outline="")
+        c.create_text(10, 13, anchor="w", fill=ACCENT, font=self.bold, text="‹")
+        c.create_text(24, 13, anchor="w", fill=SUBTEXT, font=self.small,
+                      text=parent)
+        px = 24 + self.small.measure(parent)
+        c.create_text(px + 6, 13, anchor="w", fill=SUBTEXT, font=self.small,
+                      text="/")
+        c.create_text(px + 16, 13, anchor="w", fill=TEXT, font=self.small,
+                      text=here)
+        self.click_regions.append((0, 26, (action, None)))
+        return 40
 
     def _draw_detail(self, seg):
         c = self.canvas
         width = c.winfo_width() or 420
         r = seg.spells.get(self.detail_key)
 
-        # Back button (always available).
-        c.create_rectangle(6, 6, 70, 26, fill=TRACK, outline="")
-        c.create_text(14, 16, anchor="w", fill=ACCENT, font=self.small, text="← Back")
-        self.click_regions.append((6, 26, ("back", None)))
+        parent = "Fight" if self.tab == "fights" else "All spells"
+        name = (r.name + ("  (pet)" if r.is_pet else "")) if r else "?"
+        y = self._draw_crumb("back", parent, name)
 
         if r is None or r.total == 0:
-            c.create_text(10, 40, anchor="w", fill=SUBTEXT, font=self.small,
+            c.create_text(10, y + 4, anchor="w", fill=SUBTEXT, font=self.small,
                           text="No data for this spell in this view.")
             return
 
-        y = 36
-        c.create_text(8, y, anchor="w", fill=TEXT, font=self.bold,
+        c.create_text(8, y, anchor="w", fill=TEXT, font=self.big,
                       text=r.name + ("  (pet)" if r.is_pet else ""))
-        y += 22
+        y += 26
 
         casts = str(r.casts) if r.casts else "-"
         dps = abbrev(r.total / seg.active_time) if seg.active_time > 0.5 else "-"
@@ -804,6 +1155,108 @@ class TrackMeUI:
                               font=self.fixed, text=target[:24])
             y += 15
 
+    # -- fights tab -----------------------------------------------------------
+
+    def _rebuild_fight_menu(self):
+        """Refill the dropdown when the fight history changes."""
+        fights = list(self.meter.fights)
+        sig = (len(fights),
+               id(fights[0]) if fights else None,
+               id(fights[-1]) if fights else None)
+        if sig == self._fights_sig:
+            return
+        self._fights_sig = sig
+        self._fight_items = []
+        menu = self.fight_menu["menu"]
+        menu.delete(0, "end")
+        for f in reversed(fights):                 # newest first
+            when = datetime.fromtimestamp(f.first_ts).strftime("%H:%M:%S")
+            label = (f"{when}  {f.label()[:26]}  "
+                     f"({fmt_dur(f.duration())}, {abbrev(f.total)})")
+            self._fight_items.append((label, f))
+            menu.add_command(label=label,
+                             command=lambda seg=f: self._pick_fight(seg))
+
+    def _pick_fight(self, seg):
+        self.fight_sel = seg
+        self.mode, self.detail_key = "list", None
+        self.death_sel = None
+        self.canvas.yview_moveto(0)
+        self._redraw()
+
+    def _redraw_fights(self):
+        self._rebuild_fight_menu()
+        fights = self.meter.fights
+        if not fights:
+            self.fight_var.set("(no fights yet)")
+            self.lbl_summary.config(
+                text="A fight is archived once you leave combat for 5s.")
+            self.canvas.create_text(
+                12, 14, anchor="w", fill=SUBTEXT, font=self.small,
+                text="No finished fights yet. Fight something, then leave combat.")
+            return
+
+        # Default to the newest fight; heal a selection that was evicted or
+        # wiped by a session reset.
+        if self.fight_sel is None or self.fight_sel not in fights:
+            self.fight_sel = fights[-1]
+            self.mode, self.detail_key = "list", None
+            self.death_sel = None
+        f = self.fight_sel
+
+        label = next((lbl for lbl, seg in self._fight_items if seg is f), "")
+        if self.fight_var.get() != label:
+            self.fight_var.set(label)
+        self.lbl_summary.config(
+            text=f"{f.label()}    {commas(f.total)}    "
+                 f"{abbrev(f.dps())} DPS    {fmt_dur(f.duration())}")
+
+        if self.death_sel is not None:
+            self._draw_death_detail()      # its Back returns to the fight view
+        elif self.mode == "detail" and self.detail_key:
+            self._draw_detail(f)           # its Back returns to the fight view
+        else:
+            self._draw_fight_view(f)
+
+    def _draw_fight_view(self, f):
+        """One fight: header, deaths that happened during it, spell breakdown."""
+        c = self.canvas
+        width = c.winfo_width() or 420
+        y = 12
+        when = datetime.fromtimestamp(f.first_ts).strftime("%H:%M:%S")
+        c.create_text(8, y, anchor="w", fill=TEXT, font=self.big,
+                      text=f.label())
+        c.create_text(width - 10, y, anchor="e", fill=SUBTEXT, font=self.small,
+                      text=when)
+        y += 22
+        if f.label() != f.main_target():
+            c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.body,
+                          text=f"vs {f.main_target()}")
+            y += 18
+
+        deaths = self.meter.deaths_during(f)
+        if deaths:
+            y += 4
+            c.create_text(8, y, anchor="w", fill=DANGER, font=self.small,
+                          text=f"DEATHS ({len(deaths)})")
+            y += 14
+            row_h = 20
+            for d in deaths:
+                c.create_rectangle(0, y, width, y + row_h - 2,
+                                   fill=CARD, outline="")
+                c.create_rectangle(0, y, 3, y + row_h - 2, fill=DANGER, outline="")
+                dt = datetime.fromtimestamp(d.ts).strftime("%H:%M:%S")
+                blow = d.killing_blow()
+                desc = f"{dt}  {d.name}"
+                if blow:
+                    desc += f"  -  {blow[3]} {abbrev(blow[1])}"
+                c.create_text(12, y + (row_h - 2) / 2, anchor="w", fill=TEXT,
+                              font=self.fixed, text=desc[:58])
+                self.click_regions.append((y, y + row_h - 2, ("death", d)))
+                y += row_h
+        y += 10
+        self._draw_list(f, y0=y)
+
     # -- deaths tab -----------------------------------------------------------
 
     def _draw_death_list(self):
@@ -817,11 +1270,11 @@ class TrackMeUI:
         width = c.winfo_width() or 420
         row_h = 34
         y = 2
-        for idx in range(len(deaths) - 1, -1, -1):     # newest first
-            d = deaths[idx]
-            c.create_rectangle(0, y, width, y + row_h - 2, fill=PANEL, outline="")
+        for d in reversed(deaths):                     # newest first
+            c.create_rectangle(0, y, width, y + row_h - 2, fill=CARD, outline="")
+            c.create_rectangle(0, y, 3, y + row_h - 2, fill=DANGER, outline="")
             when = datetime.fromtimestamp(d.ts).strftime("%H:%M:%S")
-            c.create_text(8, y + 9, anchor="w", fill=TEXT, font=self.bold, text=d.name)
+            c.create_text(12, y + 9, anchor="w", fill=TEXT, font=self.bold, text=d.name)
             c.create_text(width - 8, y + 9, anchor="e", fill=SUBTEXT, font=self.small, text=when)
             blow = d.killing_blow()
             if blow:
@@ -830,30 +1283,30 @@ class TrackMeUI:
                 sub = f"killed by {who}  —  {spell} {commas(amount)}"
             else:
                 sub = "no incoming damage in the last %ds" % int(DEATH_WINDOW)
-            c.create_text(8, y + 24, anchor="w", fill=SUBTEXT, font=self.fixed, text=sub[:60])
-            self.click_regions.append((y, y + row_h - 2, ("death", idx)))
-            y += row_h
+            c.create_text(12, y + 24, anchor="w", fill=SUBTEXT, font=self.fixed, text=sub[:60])
+            # Click region carries the RECORD, not an index: the deque evicts
+            # old deaths, which would silently shift indices under us.
+            self.click_regions.append((y, y + row_h - 2, ("death", d)))
+            y += row_h + 2
 
     def _draw_death_detail(self):
         c = self.canvas
         width = c.winfo_width() or 420
-        deaths = list(self.meter.deaths)
-        if self.death_sel is None or self.death_sel >= len(deaths):
+        d = self.death_sel
+        if d is None or d not in self.meter.deaths:   # evicted or reset
             self.death_sel = None
-            self._draw_death_list()
+            if self.tab == "fights" and self.fight_sel is not None:
+                self._draw_fight_view(self.fight_sel)
+            else:
+                self._draw_death_list()
             return
-        d = deaths[self.death_sel]
 
-        # Back button.
-        c.create_rectangle(6, 6, 70, 26, fill=TRACK, outline="")
-        c.create_text(14, 16, anchor="w", fill=ACCENT, font=self.small, text="← Back")
-        self.click_regions.append((6, 26, ("dback", None)))
-
-        y = 36
         when = datetime.fromtimestamp(d.ts).strftime("%H:%M:%S")
-        c.create_text(8, y, anchor="w", fill=TEXT, font=self.bold,
-                      text=f"{d.name} died  {when}")
-        y += 22
+        parent = "Fight" if self.tab == "fights" else "Deaths"
+        y = self._draw_crumb("dback", parent, f"{d.name}  {when}")
+        c.create_text(8, y, anchor="w", fill=TEXT, font=self.big,
+                      text=f"{d.name} died")
+        y += 26
         c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.fixed,
                       text=f"Damage taken in last {int(DEATH_WINDOW)}s: "
                            f"{commas(d.total_taken())}   ({len(d.events)} hits)")
@@ -890,13 +1343,13 @@ class TrackMeUI:
 
             if is_fatal:                     # highlight the killing blow's row
                 c.create_rectangle(4, y - row_h + 4, width - 4, y + 4,
-                                   fill=PANEL, outline="")
+                                   fill="#2a1a20", outline="")
 
             # Reserve space on the right for the overkill tag (fatal row only).
             right = width - 8
             ok_text = f"OVK {abbrev(overkill)}" if (is_fatal and overkill > 0) else None
             if ok_text:
-                c.create_text(right, y, anchor="e", fill="#ff6b6b",
+                c.create_text(right, y, anchor="e", fill=DANGER,
                               font=self.fixed, text=ok_text)
                 right -= self.fixed.measure(ok_text) + 10
 
@@ -910,14 +1363,80 @@ class TrackMeUI:
                           text=label[:max_chars])
             y += row_h
 
+    # -- settings tab ---------------------------------------------------------
+
+    def _draw_settings(self):
+        c = self.canvas
+        width = c.winfo_width() or 420
+        y = 14
+        c.create_text(8, y, anchor="w", fill=ACCENT, font=self.small,
+                      text="CHARACTER")
+        y += 20
+        c.create_text(8, y, anchor="w", fill=TEXT, font=self.body,
+                      text="Your name")
+        c.create_window(width - 10, y, anchor="e",
+                        window=self._make_name_entry())
+        y += 18
+        c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.small,
+                      text="Blank = auto-detect. Press Enter to apply "
+                           "(re-reads the log).")
+        y += 30
+
+        c.create_text(8, y, anchor="w", fill=ACCENT, font=self.small,
+                      text="COLORS")
+        c.create_text(width - 10, y, anchor="e", fill=SUBTEXT, font=self.small,
+                      text="click a row to change")
+        y += 16
+        row_h = 26
+        for key, (label, _default) in THEME.items():
+            cur = globals()[key]
+            c.create_rectangle(0, y, width, y + row_h - 4, fill=CARD, outline="")
+            c.create_rectangle(10, y + 4, 26, y + row_h - 8,
+                               fill=cur, outline=TRACK)
+            c.create_text(36, y + (row_h - 4) / 2, anchor="w", fill=TEXT,
+                          font=self.body, text=label)
+            c.create_text(width - 10, y + (row_h - 4) / 2, anchor="e",
+                          fill=SUBTEXT, font=self.fixed, text=cur)
+            self.click_regions.append((y, y + row_h - 4, ("color", key)))
+            y += row_h
+
+        y += 8
+        c.create_rectangle(0, y, width, y + 24, fill=CARD, outline="")
+        c.create_text(10, y + 11, anchor="w", fill=DANGER, font=self.small,
+                      text="Reset colors to defaults")
+        self.click_regions.append((y, y + 24, ("colreset", None)))
+
+    def _pick_color(self, key):
+        label = THEME[key][0]
+        _rgb, hexval = colorchooser.askcolor(
+            color=globals()[key], parent=self.root,
+            title=f"TrackMe - {label}")
+        if hexval:
+            globals()[key] = hexval
+            self._after_theme_change()
+
+    def _reset_colors(self):
+        apply_theme(default_colors())
+        self._after_theme_change()
+
+    def _after_theme_change(self):
+        self._restyle_widgets()
+        self._save_settings_now()     # persist immediately, not just on close
+        self._redraw()
+
     def run(self):
         self.root.mainloop()
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_LOG_PATH
-    name = sys.argv[2] if len(sys.argv) > 2 else None
-    TrackMeUI(path, name).run()
+    settings = load_settings()
+    apply_theme(settings.get("colors"))
+    # CLI args win; then saved settings; then the built-in defaults.
+    path = (sys.argv[1] if len(sys.argv) > 1
+            else settings.get("log_path") or DEFAULT_LOG_PATH)
+    name = (sys.argv[2] if len(sys.argv) > 2
+            else settings.get("name") or None)
+    TrackMeUI(path, name, settings).run()
 
 
 if __name__ == "__main__":
