@@ -25,7 +25,7 @@ import os
 import re
 import sys
 import time
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime
 
 import tkinter as tk
@@ -43,8 +43,17 @@ DEFAULT_LOG_PATH = (
 REFRESH_MS = 1000     # how often we poll the log file (WoW flushes in bursts)
 COMBAT_GAP = 5.0      # seconds of no activity that ends the "current" fight
 MAX_ROWS = 22         # spell rows drawn in the main list
+HIT_STORE_CAP = 2000  # individual hits kept per spell (bounds memory)
+HIT_SHOW = 400        # individual hits drawn in the detail view
+
+# Deaths tab: on every player death we snapshot the damage they took in the
+# few seconds beforehand so you can see what killed them.
+DEATH_WINDOW = 5.0    # seconds of incoming damage kept before a death
+INCOMING_CAP = 64     # incoming hits buffered per player (bounds memory)
+DEATH_KEEP = 50       # death records retained for the Deaths tab
 
 # Combat-log object-flag bits.
+AFFILIATION_MINE = 0x00000001  # set by WoW on the logging character (and its pets)
 TYPE_PLAYER   = 0x00000400
 TYPE_PET      = 0x00001000
 TYPE_GUARDIAN = 0x00002000
@@ -123,7 +132,7 @@ def to_int(value, base=10, default=0):
 class SpellRecord:
     __slots__ = ("key", "name", "spell_id", "is_pet", "school",
                  "casts", "n_hits", "n_total", "n_max",
-                 "c_hits", "c_total", "c_max", "total")
+                 "c_hits", "c_total", "c_max", "total", "events")
 
     def __init__(self, key, name, spell_id, is_pet, school):
         self.key, self.name, self.spell_id = key, name, spell_id
@@ -132,8 +141,9 @@ class SpellRecord:
         self.n_hits = self.n_total = self.n_max = 0
         self.c_hits = self.c_total = self.c_max = 0
         self.total = 0
+        self.events = deque(maxlen=HIT_STORE_CAP)  # (ts, amount, crit, target)
 
-    def add_damage(self, amount, crit):
+    def add_damage(self, amount, crit, ts, target):
         if crit:
             self.c_hits += 1
             self.c_total += amount
@@ -143,6 +153,7 @@ class SpellRecord:
             self.n_total += amount
             self.n_max = max(self.n_max, amount)
         self.total += amount
+        self.events.append((ts, amount, crit, target))
 
     @property
     def hits(self):
@@ -151,6 +162,31 @@ class SpellRecord:
     @property
     def crit_pct(self):
         return (self.c_hits / self.hits * 100) if self.hits else 0.0
+
+
+class DeathRecord:
+    """A player death plus the incoming damage that led up to it."""
+    __slots__ = ("ts", "name", "guid", "events")
+
+    def __init__(self, ts, name, guid, events):
+        self.ts = ts          # timestamp of the UNIT_DIED event
+        self.name = name      # dead player's name
+        self.guid = guid      # dead player's GUID
+        # events: list of (ts, amount, overkill, spell_name, source_name, crit, school)
+        self.events = events
+
+    def total_taken(self):
+        return sum(e[1] for e in self.events)
+
+    def killing_blow(self):
+        """The fatal hit: the last event carrying overkill, else the last hit."""
+        if not self.events:
+            return None
+        fatal = self.events[-1]
+        for e in self.events:
+            if e[2] > 0:      # overkill > 0 marks the blow that dropped them
+                fatal = e
+        return fatal
 
 
 class Segment:
@@ -182,8 +218,8 @@ class Segment:
             rec.school = school
         return rec
 
-    def record(self, key, name, spell_id, is_pet, school, amount, crit):
-        self._rec(key, name, spell_id, is_pet, school).add_damage(amount, crit)
+    def record(self, key, name, spell_id, is_pet, school, amount, crit, ts, target):
+        self._rec(key, name, spell_id, is_pet, school).add_damage(amount, crit, ts, target)
         self.total += amount
 
     def record_cast(self, key, name, spell_id, is_pet, school):
@@ -208,16 +244,30 @@ class Meter:
         self.forced_guid = None
         self.player_counts = Counter()   # Player-GUID -> event count
         self._locked_guid = None
+        self.mine_guid = None            # player GUID flagged AFFILIATION_MINE (0x1)
         self.me_name = None
+        # Death tracking (for ALL players, not just "you").
+        self.incoming = {}               # player-GUID -> deque of recent hits taken
+        self.deaths = deque(maxlen=DEATH_KEEP)
 
     def reset_all(self):
         self.current.reset()
         self.overall.reset()
+        self.incoming.clear()
+        self.deaths.clear()
 
     def me(self):
-        """The GUID we attribute damage to (auto = most active player)."""
+        """The GUID we attribute damage to.
+
+        Priority: (1) a name you typed, (2) the AFFILIATION_MINE flag — WoW sets
+        it only on the logging character, so it's a definitive self-marker — and
+        only then (3) the most-active-player fallback, for the rare log where the
+        MINE bit never appears.
+        """
         if self.forced_guid:
             return self.forced_guid
+        if self.mine_guid:
+            return self.mine_guid
         if self._locked_guid:
             return self._locked_guid
         if not self.player_counts:
@@ -246,6 +296,14 @@ class Meter:
 
         flags = to_int(fields[3], 16)
         src_guid, src_name = fields[1], fields[2]
+        target = fields[6] if len(fields) > 6 else ""
+
+        # Death tracking runs for every player (not just "you") and before the
+        # "is this my damage?" gate below, so it sees the whole group.
+        if event == "UNIT_DIED":
+            self._note_death(ts, fields)
+            return
+        self._track_incoming(ts, event, fields)
 
         if self.forced_name and (flags & TYPE_PLAYER) and self.forced_name in src_name.lower():
             self.forced_guid = src_guid
@@ -253,6 +311,8 @@ class Meter:
         # Which player does this event belong to?
         if flags & TYPE_PLAYER:
             self.player_counts[src_guid] += 1
+            if self.mine_guid is None and (flags & AFFILIATION_MINE):
+                self.mine_guid = src_guid   # definitive: this is the logging char
             attr_guid, is_pet = src_guid, False
         elif flags & PET_MASK:
             attr_guid, is_pet = self._owner_guid(fields, event), True
@@ -276,8 +336,8 @@ class Meter:
                 return
             key = ("pet:" if is_pet else "you:") + spell_id
             self._advance(ts)
-            self.current.record(key, spell_name, spell_id, is_pet, school, amount, crit)
-            self.overall.record(key, spell_name, spell_id, is_pet, school, amount, crit)
+            self.current.record(key, spell_name, spell_id, is_pet, school, amount, crit, ts, target)
+            self.overall.record(key, spell_name, spell_id, is_pet, school, amount, crit, ts, target)
 
         elif event == "SWING_DAMAGE":
             amount = to_int(fields[-10])
@@ -287,8 +347,8 @@ class Meter:
             key = "pet:swing" if is_pet else "you:swing"
             name = "Melee (Pet)" if is_pet else "Melee"
             self._advance(ts)
-            self.current.record(key, name, None, is_pet, 1, amount, crit)
-            self.overall.record(key, name, None, is_pet, 1, amount, crit)
+            self.current.record(key, name, None, is_pet, 1, amount, crit, ts, target)
+            self.overall.record(key, name, None, is_pet, 1, amount, crit, ts, target)
 
         elif event == "SPELL_CAST_SUCCESS":
             if len(fields) < 11:
@@ -308,6 +368,56 @@ class Meter:
             self.current.reset()
         self.current.note_time(ts)
         self.overall.note_time(ts)
+
+    # -- death tracking -------------------------------------------------------
+
+    def _track_incoming(self, ts, event, fields):
+        """Buffer damage TAKEN by any player, keyed by the victim's GUID."""
+        if len(fields) < 8:
+            return
+        dest_flags = to_int(fields[7], 16)
+        if not (dest_flags & TYPE_PLAYER):     # only care about damage to players
+            return
+
+        if event in DAMAGE_EVENTS:
+            if len(fields) < 12:
+                return
+            spell_name = fields[10]
+            school = to_int(fields[11], 0)
+        elif event == "SWING_DAMAGE":
+            spell_name, school = "Melee", 1
+        elif event == "ENVIRONMENTAL_DAMAGE":
+            # base 9 fields, then the environmental type (Falling/Fire/Drowning/...)
+            spell_name = fields[9] if len(fields) > 9 else "Environment"
+            school = 0
+        else:
+            return
+
+        amount = to_int(fields[-10])
+        if amount <= 0:
+            return
+        overkill = to_int(fields[-9])
+        crit = fields[-3] == "1"
+        victim = fields[5]
+        source = fields[2] if fields[2] not in ("nil", "") else None
+
+        dq = self.incoming.get(victim)
+        if dq is None:
+            dq = deque(maxlen=INCOMING_CAP)
+            self.incoming[victim] = dq
+        dq.append((ts, amount, overkill, spell_name, source, crit, school))
+
+    def _note_death(self, ts, fields):
+        """On UNIT_DIED for a player, snapshot the last DEATH_WINDOW s of damage."""
+        if len(fields) < 8:
+            return
+        dest_flags = to_int(fields[7], 16)
+        if not (dest_flags & TYPE_PLAYER):     # ignore NPC/pet deaths
+            return
+        guid, name = fields[5], fields[6]
+        dq = self.incoming.get(guid)
+        events = [e for e in dq if e[0] >= ts - DEATH_WINDOW] if dq else []
+        self.deaths.append(DeathRecord(ts, name, guid, events))
 
 # --------------------------------------------------------------------------
 # Log tailing (follows the newest WoWCombatLog-*.txt)
@@ -391,19 +501,25 @@ def commas(n):
     return f"{int(round(n or 0)):,}"
 
 
+CRIT_COLOR = "#ffcc66"
+
+
 class TrackMeUI:
     def __init__(self, log_path, forced_name=None):
         self.meter = Meter(forced_name)
         self.tailer = Tailer(log_path)
+        self.tab = "damage"         # "damage" | "deaths"
         self.view = "current"
+        self.mode = "list"          # "list" | "detail"
         self.detail_key = None
-        self.row_hits = []
+        self.death_sel = None       # index into meter.deaths when viewing one
+        self.click_regions = []     # (y0, y1, (action, value)) in canvas coords
 
         self.root = tk.Tk()
         self.root.title("TrackMe - live combat-log breakdown")
         self.root.configure(bg=BG)
-        self.root.geometry("400x520")
-        self.root.minsize(340, 320)
+        self.root.geometry("440x600")
+        self.root.minsize(360, 340)
 
         self.fixed = tkfont.Font(family="Consolas", size=9)
         self.bold = tkfont.Font(family="Segoe UI", size=10, weight="bold")
@@ -412,15 +528,20 @@ class TrackMeUI:
         self._build_header()
         if forced_name:
             self.name_var.set(forced_name)
+
         self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True, padx=6, pady=2)
         self.canvas.bind("<Button-1>", self._on_click)
+        self.canvas.bind("<Configure>", lambda e: self._redraw())
+        self.canvas.bind("<MouseWheel>", self._on_wheel)
+
         self.lbl_status = tk.Label(self.root, text="", fg=SUBTEXT, bg=PANEL,
                                    anchor="w", font=self.small)
         self.lbl_status.pack(fill="x", side="bottom")
 
-        self.detail = None
         self.root.after(200, self._tick)
+
+    # -- header ---------------------------------------------------------------
 
     def _build_header(self):
         top = tk.Frame(self.root, bg=PANEL)
@@ -447,23 +568,45 @@ class TrackMeUI:
         tk.Label(namebar, text="(blank = auto)", fg=SUBTEXT, bg=BG,
                  font=self.small).pack(side="left", padx=2)
 
+        tabbar = tk.Frame(self.root, bg=BG)
+        tabbar.pack(fill="x", padx=8, pady=(4, 0))
+        self.btn_dmg = tk.Button(tabbar, text="Damage", width=8, relief="flat",
+                                 bg=ACCENT, fg="#101014",
+                                 command=lambda: self._set_tab("damage"))
+        self.btn_dmg.pack(side="left", padx=(0, 4))
+        self.btn_deaths = tk.Button(tabbar, text="Deaths", width=8, relief="flat",
+                                    bg=TRACK, fg=TEXT,
+                                    command=lambda: self._set_tab("deaths"))
+        self.btn_deaths.pack(side="left")
+
         self.lbl_summary = tk.Label(self.root, text="", fg=TEXT, bg=BG,
                                     anchor="w", font=self.small)
         self.lbl_summary.pack(fill="x", padx=8, pady=(2, 2))
 
+    def _set_tab(self, tab):
+        self.tab = tab
+        self.mode, self.detail_key = "list", None
+        self.death_sel = None
+        on, off = (ACCENT, "#101014"), (TRACK, TEXT)
+        self.btn_dmg.config(bg=(on if tab == "damage" else off)[0],
+                            fg=(on if tab == "damage" else off)[1])
+        self.btn_deaths.config(bg=(on if tab == "deaths" else off)[0],
+                               fg=(on if tab == "deaths" else off)[1])
+        self.canvas.yview_moveto(0)
+        self._redraw()
+
     def _apply_name(self, *_):
-        """Type a character name (blank = auto-detect) and re-scan the log for it."""
         name = self.name_var.get().strip()
         if name.lower() == (self.meter.forced_name or ""):
             return
         self.meter = Meter(name or None)
-        # Force a full re-read of the newest log so the change applies to
-        # everything already logged, not just future events.
-        self.tailer.current_file = None
+        self.tailer.current_file = None   # force a full re-read for the new name
         self.tailer.pos = None
         self.tailer.buffer = ""
-        self.detail_key = None
+        self.mode, self.detail_key = "list", None
         self._redraw()
+
+    # -- navigation / events --------------------------------------------------
 
     def _segment(self):
         return self.meter.overall if self.view == "overall" else self.meter.current
@@ -475,16 +618,27 @@ class TrackMeUI:
 
     def _reset(self):
         self.meter.reset_all()
-        self.detail_key = None
-        if self.detail:
-            self.detail.destroy()
-            self.detail = None
+        self.mode, self.detail_key = "list", None
+        self.canvas.yview_moveto(0)
         self._redraw()
 
+    def _on_wheel(self, event):
+        self.canvas.yview_scroll(int(-event.delta / 120), "units")
+
     def _on_click(self, event):
-        for y0, y1, key in self.row_hits:
-            if y0 <= event.y <= y1:
-                self._open_detail(key)
+        y = self.canvas.canvasy(event.y)
+        for y0, y1, (action, value) in self.click_regions:
+            if y0 <= y <= y1:
+                if action == "select":
+                    self.mode, self.detail_key = "detail", value
+                elif action == "back":
+                    self.mode, self.detail_key = "list", None
+                elif action == "death":
+                    self.death_sel = value
+                elif action == "dback":
+                    self.death_sel = None
+                self.canvas.yview_moveto(0)
+                self._redraw()
                 return
 
     def _tick(self):
@@ -512,23 +666,40 @@ class TrackMeUI:
             self.lbl_status.config(
                 text=f"{live}  you={who}  {os.path.basename(path)}")
 
+    # -- rendering ------------------------------------------------------------
+
     def _redraw(self):
         seg = self._segment()
-        self.lbl_summary.config(
-            text=f"{'Overall' if self.view == 'overall' else 'Current fight'}"
-                 f"    {commas(seg.total)}    {abbrev(seg.dps())} DPS")
-
         c = self.canvas
         c.delete("all")
-        self.row_hits = []
+        self.click_regions = []
+
+        if self.tab == "deaths":
+            self.lbl_summary.config(
+                text=f"Deaths this session: {len(self.meter.deaths)}")
+            if self.death_sel is not None:
+                self._draw_death_detail()
+            else:
+                self._draw_death_list()
+        else:
+            self.lbl_summary.config(
+                text=f"{'Overall' if self.view == 'overall' else 'Current fight'}"
+                     f"    {commas(seg.total)}    {abbrev(seg.dps())} DPS")
+            if self.mode == "detail" and self.detail_key:
+                self._draw_detail(seg)
+            else:
+                self._draw_list(seg)
+
+        c.configure(scrollregion=c.bbox("all") or (0, 0, 0, 0))
+
+    def _draw_list(self, seg):
+        c = self.canvas
         rows = seg.sorted_spells()
         if not rows:
             c.create_text(12, 14, anchor="w", fill=SUBTEXT, font=self.small,
                           text="No damage yet. Ensure /combatlog is on, then fight.")
-            self._refresh_detail()
             return
-
-        width = c.winfo_width() or 388
+        width = c.winfo_width() or 420
         top_total = rows[0].total
         row_h = 22
         y = 2
@@ -543,52 +714,184 @@ class TrackMeUI:
                           font=self.fixed, text=name)
             c.create_text(width - 6, y + (row_h - 2) / 2, anchor="e", fill="#101014",
                           font=self.fixed, text=f"{abbrev(r.total)}  {pct:.0f}%")
-            self.row_hits.append((y, y + row_h - 2, r.key))
+            self.click_regions.append((y, y + row_h - 2, ("select", r.key)))
             y += row_h
-        self._refresh_detail()
 
-    def _open_detail(self, key):
-        self.detail_key = key
-        if self.detail is None or not self.detail.winfo_exists():
-            self.detail = tk.Toplevel(self.root, bg=BG)
-            self.detail.title("Spell detail")
-            self.detail.geometry("340x300")
-            self.detail.configure(bg=BG)
-            self.detail_text = tk.Label(self.detail, bg=BG, fg=TEXT, justify="left",
-                                        anchor="nw", font=self.fixed)
-            self.detail_text.pack(fill="both", expand=True, padx=10, pady=10)
-        self.detail.deiconify()
-        self.detail.lift()
-        self._refresh_detail()
-
-    def _refresh_detail(self):
-        if self.detail is None or not self.detail.winfo_exists() or not self.detail_key:
-            return
-        seg = self._segment()
+    def _draw_detail(self, seg):
+        c = self.canvas
+        width = c.winfo_width() or 420
         r = seg.spells.get(self.detail_key)
+
+        # Back button (always available).
+        c.create_rectangle(6, 6, 70, 26, fill=TRACK, outline="")
+        c.create_text(14, 16, anchor="w", fill=ACCENT, font=self.small, text="← Back")
+        self.click_regions.append((6, 26, ("back", None)))
+
         if r is None or r.total == 0:
-            self.detail_text.config(text="No data for this spell in the current view.")
+            c.create_text(10, 40, anchor="w", fill=SUBTEXT, font=self.small,
+                          text="No data for this spell in this view.")
             return
-        n_avg = (r.n_total / r.n_hits) if r.n_hits else 0
-        c_avg = (r.c_total / r.c_hits) if r.c_hits else 0
-        pct_of = (r.total / seg.total * 100) if seg.total else 0
+
+        y = 36
+        c.create_text(8, y, anchor="w", fill=TEXT, font=self.bold,
+                      text=r.name + ("  (pet)" if r.is_pet else ""))
+        y += 22
+
         casts = str(r.casts) if r.casts else "-"
         dps = abbrev(r.total / seg.active_time) if seg.active_time > 0.5 else "-"
-        lines = [
-            f"{r.name}" + ("  (pet)" if r.is_pet else ""),
-            "-" * 40,
-            f"Casts:      {casts:<10} Hits: {r.hits}",
-            f"Crit rate:  {r.crit_pct:.1f}%   ({r.c_hits} crit / {r.n_hits} normal)",
-            f"Total:      {commas(r.total)}   ({pct_of:.1f}% of you)",
-            f"DPS:        {dps}",
-            "",
-            f"{'':10}{'Non-crit':>12}{'Crit':>12}",
-            f"{'Hits':10}{r.n_hits:>12}{r.c_hits:>12}",
-            f"{'Damage':10}{abbrev(r.n_total):>12}{abbrev(r.c_total):>12}",
-            f"{'Average':10}{abbrev(n_avg):>12}{abbrev(c_avg):>12}",
-            f"{'Biggest':10}{abbrev(r.n_max):>12}{abbrev(r.c_max):>12}",
-        ]
-        self.detail_text.config(text="\n".join(lines))
+        pct_of = (r.total / seg.total * 100) if seg.total else 0
+        for text in (
+            f"Casts: {casts}     Hits: {r.hits}     Crit: {r.crit_pct:.1f}%",
+            f"Total: {commas(r.total)}   ({pct_of:.1f}% of you)     DPS: {dps}",
+        ):
+            c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.fixed, text=text)
+            y += 16
+
+        # Non-crit vs crit table (right-aligned number columns).
+        y += 4
+        col_n, col_c = width - 120, width - 20
+        n_avg = (r.n_total / r.n_hits) if r.n_hits else 0
+        c_avg = (r.c_total / r.c_hits) if r.c_hits else 0
+        c.create_text(col_n, y, anchor="e", fill=SUBTEXT, font=self.fixed, text="Non-crit")
+        c.create_text(col_c, y, anchor="e", fill=CRIT_COLOR, font=self.fixed, text="Crit")
+        y += 16
+        for label, nval, cval in (
+            ("Hits", r.n_hits, r.c_hits),
+            ("Damage", abbrev(r.n_total), abbrev(r.c_total)),
+            ("Average", abbrev(n_avg), abbrev(c_avg)),
+            ("Biggest", abbrev(r.n_max), abbrev(r.c_max)),
+        ):
+            c.create_text(8, y, anchor="w", fill=TEXT, font=self.fixed, text=label)
+            c.create_text(col_n, y, anchor="e", fill=TEXT, font=self.fixed, text=str(nval))
+            c.create_text(col_c, y, anchor="e", fill=CRIT_COLOR, font=self.fixed, text=str(cval))
+            y += 16
+
+        # Individual hits, newest first.
+        y += 10
+        total_hits = len(r.events)
+        shown = min(total_hits, HIT_SHOW)
+        c.create_text(8, y, anchor="w", fill=ACCENT, font=self.small,
+                      text=f"Hits (newest first) - showing {shown} of {total_hits}")
+        y += 18
+        x_amt = 150
+        for ts, amount, crit, target in list(r.events)[-HIT_SHOW:][::-1]:
+            when = datetime.fromtimestamp(ts).strftime("%H:%M:%S")
+            c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.fixed, text=when)
+            c.create_text(x_amt, y, anchor="e", fill=CRIT_COLOR if crit else TEXT,
+                          font=self.fixed, text=commas(amount))
+            if crit:
+                c.create_text(x_amt + 8, y, anchor="w", fill=CRIT_COLOR,
+                              font=self.fixed, text="crit")
+            if target:
+                c.create_text(x_amt + 48, y, anchor="w", fill=SUBTEXT,
+                              font=self.fixed, text=target[:24])
+            y += 15
+
+    # -- deaths tab -----------------------------------------------------------
+
+    def _draw_death_list(self):
+        c = self.canvas
+        deaths = list(self.meter.deaths)
+        if not deaths:
+            c.create_text(12, 14, anchor="w", fill=SUBTEXT, font=self.small,
+                          text="No deaths recorded yet. Deaths of any player "
+                               "in your group are captured live.")
+            return
+        width = c.winfo_width() or 420
+        row_h = 34
+        y = 2
+        for idx in range(len(deaths) - 1, -1, -1):     # newest first
+            d = deaths[idx]
+            c.create_rectangle(0, y, width, y + row_h - 2, fill=PANEL, outline="")
+            when = datetime.fromtimestamp(d.ts).strftime("%H:%M:%S")
+            c.create_text(8, y + 9, anchor="w", fill=TEXT, font=self.bold, text=d.name)
+            c.create_text(width - 8, y + 9, anchor="e", fill=SUBTEXT, font=self.small, text=when)
+            blow = d.killing_blow()
+            if blow:
+                _, amount, _ok, spell, src, _crit, _sch = blow
+                who = src or "environment"
+                sub = f"killed by {who}  —  {spell} {commas(amount)}"
+            else:
+                sub = "no incoming damage in the last %ds" % int(DEATH_WINDOW)
+            c.create_text(8, y + 24, anchor="w", fill=SUBTEXT, font=self.fixed, text=sub[:60])
+            self.click_regions.append((y, y + row_h - 2, ("death", idx)))
+            y += row_h
+
+    def _draw_death_detail(self):
+        c = self.canvas
+        width = c.winfo_width() or 420
+        deaths = list(self.meter.deaths)
+        if self.death_sel is None or self.death_sel >= len(deaths):
+            self.death_sel = None
+            self._draw_death_list()
+            return
+        d = deaths[self.death_sel]
+
+        # Back button.
+        c.create_rectangle(6, 6, 70, 26, fill=TRACK, outline="")
+        c.create_text(14, 16, anchor="w", fill=ACCENT, font=self.small, text="← Back")
+        self.click_regions.append((6, 26, ("dback", None)))
+
+        y = 36
+        when = datetime.fromtimestamp(d.ts).strftime("%H:%M:%S")
+        c.create_text(8, y, anchor="w", fill=TEXT, font=self.bold,
+                      text=f"{d.name} died  {when}")
+        y += 22
+        c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.fixed,
+                      text=f"Damage taken in last {int(DEATH_WINDOW)}s: "
+                           f"{commas(d.total_taken())}   ({len(d.events)} hits)")
+        y += 20
+
+        if not d.events:
+            c.create_text(8, y, anchor="w", fill=SUBTEXT, font=self.small,
+                          text="No incoming damage was recorded in the window.")
+            return
+
+        c.create_text(8, y, anchor="w", fill=ACCENT, font=self.small,
+                      text=f"Timeline (last {int(DEATH_WINDOW)}s, fatal blow on top)")
+        y += 18
+
+        # Column geometry. Fixed (monospace) cell width lets us size text safely.
+        cw = self.fixed.measure("0") or 7
+        x_time = 8            # "-4.2s"  (left-anchored)
+        x_amt = 130          # damage number (right-anchored)
+        x_spell = 140        # "spell  source"  (left-anchored)
+        row_h = 16
+        fatal = d.killing_blow()
+
+        # Column headers.
+        c.create_text(x_time, y, anchor="w", fill=SUBTEXT, font=self.small, text="time")
+        c.create_text(x_amt, y, anchor="e", fill=SUBTEXT, font=self.small, text="damage")
+        c.create_text(x_spell, y, anchor="w", fill=SUBTEXT, font=self.small, text="source")
+        y += 16
+
+        for e in reversed(d.events):        # newest (fatal) first
+            ts, amount, overkill, spell, src, crit, school = e
+            dt = ts - d.ts
+            color = SCHOOL_COLORS.get(school, DEFAULT_COLOR)
+            is_fatal = e is fatal
+
+            if is_fatal:                     # highlight the killing blow's row
+                c.create_rectangle(4, y - row_h + 4, width - 4, y + 4,
+                                   fill=PANEL, outline="")
+
+            # Reserve space on the right for the overkill tag (fatal row only).
+            right = width - 8
+            ok_text = f"OVK {abbrev(overkill)}" if (is_fatal and overkill > 0) else None
+            if ok_text:
+                c.create_text(right, y, anchor="e", fill="#ff6b6b",
+                              font=self.fixed, text=ok_text)
+                right -= self.fixed.measure(ok_text) + 10
+
+            c.create_text(x_time, y, anchor="w", fill=SUBTEXT, font=self.fixed,
+                          text=f"{dt:+.1f}s")
+            c.create_text(x_amt, y, anchor="e", fill=CRIT_COLOR if crit else TEXT,
+                          font=self.fixed, text=commas(amount))
+            label = spell + (f"  {src}" if src else "")
+            max_chars = max(4, int((right - x_spell) / cw))
+            c.create_text(x_spell, y, anchor="w", fill=color, font=self.fixed,
+                          text=label[:max_chars])
+            y += row_h
 
     def run(self):
         self.root.mainloop()

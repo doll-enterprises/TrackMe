@@ -59,6 +59,7 @@ WoW still writes the full detail to disk via `/combatlog`
 - Updates arrive in small bursts — WoW flushes the log file every few seconds, so
   "live" has a second or two of latency. That's a client behavior, not the app.
 - `trackme.py` is the app. `test_parse.py` is a regression test for the log
-  parser (`py test_parse.py`).
+  parser and the death snapshot — run it with `py test_parse.py`, or just
+  double-click **`Test.bat`** (it pauses so you can read the result).
 - `TrackMe.lua` / `TrackMe.toc` are the original in-game addon, kept for
   reference — they can't provide the crit/hit detail on Midnight (see above).
