@@ -19,14 +19,17 @@ WoW still writes the full detail to disk via `/combatlog`
    (Type it again to stop.) Advanced Combat Logging is optional — plain logging
    already includes damage, crit and spell info.
 2. **Run the app** (Python 3, uses only the standard library / Tkinter).
-   Double-click **`TrackMe.bat`**, or from a terminal:
+   Double-click **`TrackMe.vbs`** — it opens just the app window, with **no
+   command-prompt window** alongside it. (Prefer `TrackMe.bat` when you want to
+   see console output for troubleshooting.) Or from a terminal:
 
    ```
    py trackme.py
    ```
 
    Note: use `py`, not `python` — on Windows `python` may be a Microsoft Store
-   stub that isn't the real interpreter. `TrackMe.bat` uses `py` for you.
+   stub that isn't the real interpreter. `TrackMe.bat`/`TrackMe.vbs` do this for
+   you (`.vbs` uses `pyw`, the windowless launcher).
 
    By default it watches the WoW `Logs` folder and follows the **newest**
    `WoWCombatLog-*.txt` (Midnight writes a fresh timestamped file each session).

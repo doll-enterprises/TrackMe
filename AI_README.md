@@ -150,9 +150,12 @@ py trackme.py "D:\path\to\Logs" Name   # explicit folder + character
 py test_parse.py                       # regression test (parser + deaths)
 ```
 
-Double-click launchers (both `cd /d "%~dp0"` then use `py`): **`TrackMe.bat`** runs
-the app; **`Test.bat`** runs the regression tests and pauses so you can read the
-result. Keep new `.bat` files in this same style.
+Double-click launchers: **`TrackMe.vbs`** runs the app with **no console window**
+(WScript runs `pyw` — the windowless Python launcher — hidden; this is the one to
+hand the user). **`TrackMe.bat`** runs it *with* a console (handy for seeing
+errors) — both `cd /d "%~dp0"`. **`Test.bat`** runs the regression tests and
+pauses. A `.bat` always flashes a console; only `wscript`/`pyw` avoids it — don't
+"fix" the no-console launcher back into a `.bat`.
 
 Use `py`, not `python` (Windows Store stub). `test_parse.py` builds lines in the
 real Midnight format and asserts both the damage parse and a death snapshot
