@@ -623,6 +623,13 @@ class TrackMeUI:
         self._redraw()
 
     def _on_wheel(self, event):
+        # Only scroll when the content is actually taller than the viewport;
+        # otherwise the wheel would drift the (fully visible) list up and down.
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            return
+        if (bbox[3] - bbox[1]) <= self.canvas.winfo_height():
+            return
         self.canvas.yview_scroll(int(-event.delta / 120), "units")
 
     def _on_click(self, event):
@@ -690,7 +697,17 @@ class TrackMeUI:
             else:
                 self._draw_list(seg)
 
-        c.configure(scrollregion=c.bbox("all") or (0, 0, 0, 0))
+        # Pin the scroll region's top to 0 and make it at least as tall as the
+        # viewport, so short content stays put (no phantom scrolling) while long
+        # content still scrolls.
+        bbox = c.bbox("all")
+        if bbox:
+            view_h = c.winfo_height()
+            c.configure(scrollregion=(0, 0, bbox[2], max(bbox[3], view_h)))
+            if bbox[3] <= view_h:
+                c.yview_moveto(0)
+        else:
+            c.configure(scrollregion=(0, 0, 0, 0))
 
     def _draw_list(self, seg):
         c = self.canvas
