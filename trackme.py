@@ -43,6 +43,8 @@ DEFAULT_LOG_PATH = (
 )
 
 REFRESH_MS = 1000     # how often we poll the log file (WoW flushes in bursts)
+CATCHUP_MS = 15       # poll cadence while a backlog is being chewed through
+READ_CHUNK = 1_000_000  # max bytes consumed per poll (keeps the UI responsive)
 COMBAT_GAP = 5.0      # seconds of no activity that ends the "current" fight
 MAX_ROWS = 22         # spell rows drawn in the main list
 HIT_STORE_CAP = 2000  # individual hits kept per spell (bounds memory)
@@ -93,6 +95,24 @@ DAMAGE_EVENTS = {
     "SPELL_BUILDING_DAMAGE", "DAMAGE_SHIELD",
 }
 
+# Every event type the Meter actually consumes. Anything else (aura spam,
+# heals, energizes - the bulk of a log) is skipped BEFORE the expensive
+# csv/timestamp parse; see quick_event().
+INTERESTING_EVENTS = DAMAGE_EVENTS | {
+    "SWING_DAMAGE", "SPELL_CAST_SUCCESS", "ENVIRONMENTAL_DAMAGE",
+    "UNIT_DIED", "ZONE_CHANGE", "ENCOUNTER_START",
+}
+
+
+def quick_event(line):
+    """Cheaply extract the event name ('7/13/2026 00:15:35.123-4  EVENT,...')
+    without regex or csv. Returns None if the line has no event field."""
+    i = line.find(",")
+    if i < 0:
+        return None
+    j = line.rfind(" ", 0, i)
+    return line[j + 1:i]
+
 SCHOOL_COLORS = {
     1:  "#d9b96a",  # Physical
     2:  "#f4e6a8",  # Holy
@@ -121,12 +141,31 @@ def is_value(tok):
     return tok == "nil" or bool(NUM_RE.match(tok))
 
 
+# strptime is the hottest call when chewing through a large log, and events
+# arrive in bursts within the same second - so cache epoch per whole second.
+_TS_CACHE = {}
+
+
 def parse_timestamp(ts):
-    core = re.sub(r"[-+]\d+$", "", ts).strip()
-    try:
-        return datetime.strptime(core, "%m/%d/%Y %H:%M:%S.%f").timestamp()
-    except ValueError:
-        return None
+    # "7/13/2026 00:15:35.123-4" -> seconds part (cached) + fraction.
+    main, _, rest = ts.partition(".")
+    base = _TS_CACHE.get(main)
+    if base is None:
+        try:
+            base = datetime.strptime(main.strip(),
+                                     "%m/%d/%Y %H:%M:%S").timestamp()
+        except ValueError:
+            return None
+        if len(_TS_CACHE) > 200_000:      # bound memory across huge sessions
+            _TS_CACHE.clear()
+        _TS_CACHE[main] = base
+    digits = ""
+    for ch in rest:                        # fraction ends at the tz offset
+        if ch.isdigit():
+            digits += ch
+        else:
+            break
+    return base + (int(digits) / 10 ** len(digits) if digits else 0.0)
 
 
 def parse_line(line):
@@ -505,6 +544,13 @@ class Tailer:
         self.current_file = None
         self.pos = None
         self.buffer = ""
+        self.size = 0          # last known file size (for progress reporting)
+
+    def backlog(self):
+        """Bytes still unread in the current file (drives the progress bar)."""
+        if self.pos is None:
+            return 0
+        return max(0, self.size - self.pos)
 
     def _resolve(self):
         p = self.given
@@ -531,6 +577,7 @@ class Tailer:
             size = os.path.getsize(target)
         except OSError:
             return [], reset, target
+        self.size = size
 
         if self.pos is None:
             self.pos = 0                      # read the current file from start
@@ -541,9 +588,12 @@ class Tailer:
         if size == self.pos:
             return [], reset, target
 
+        # Read at most READ_CHUNK bytes per poll: a huge backlog (first launch
+        # against a long session) is consumed across many quick ticks instead
+        # of freezing the UI in one giant read.
         with open(target, "r", encoding="utf-8", errors="replace") as f:
             f.seek(self.pos)
-            data = f.read()
+            data = f.read(READ_CHUNK)
             self.pos = f.tell()
 
         self.buffer += data
@@ -655,6 +705,7 @@ class TrackMeUI:
 
         self._hover = None          # (y0, y1) of the click region under the mouse
         self._mouse_y = None        # last mouse y (canvas coords), for re-hover
+        self._skip_draws = 0        # redraw throttle while loading a backlog
 
         self._build_header()
         self._build_statusbar()
@@ -794,6 +845,25 @@ class TrackMeUI:
         self.lbl_status = tk.Label(bar, text="", anchor="w", font=self.small)
         self.lbl_status.pack(side="left", fill="x", expand=True, padx=8, pady=2)
         self._reg(self.lbl_status, bg="PANEL", fg="SUBTEXT")
+
+        # Thin progress strip above the status bar; the accent fill's relwidth
+        # is the loading fraction (0 = idle, it reads as a divider line).
+        self.progress_track = tk.Frame(self.root, height=3)
+        self.progress_track.pack(fill="x", side="bottom")
+        self._reg(self.progress_track, bg="TRACK")
+        self.progress_fill = tk.Frame(self.progress_track)
+        self.progress_fill.place(x=0, y=0, relheight=1.0, relwidth=0.0)
+        self._reg(self.progress_fill, bg="ACCENT")
+
+    def _show_progress(self, pos, total):
+        frac = (pos / total) if total else 0.0
+        self.progress_fill.place_configure(relwidth=max(0.0, min(1.0, frac)))
+        self.lbl_status.config(
+            text=f"loading log... {frac * 100:.0f}%   "
+                 f"({pos / 1e6:.1f} / {total / 1e6:.1f} MB)")
+
+    def _hide_progress(self):
+        self.progress_fill.place_configure(relwidth=0.0)
 
     def _restyle_widgets(self):
         """Re-apply the (possibly changed) palette to every static widget."""
@@ -954,19 +1024,40 @@ class TrackMeUI:
                 return
 
     def _tick(self):
+        catching_up = False
         try:
             lines, reset, path = self.tailer.poll()
             if reset:
                 self.meter.reset_all()
+            feed = self.meter.feed
             for line in lines:
+                # Cheap pre-filter: skip aura/heal/energize spam (the bulk of
+                # a log) before paying for csv + timestamp parsing.
+                ev = quick_event(line)
+                if ev is None or ev not in INTERESTING_EVENTS:
+                    continue
                 parsed = parse_line(line)
                 if parsed:
-                    self.meter.feed(*parsed)
-            self._update_status(path, len(lines))
+                    feed(*parsed)
+            catching_up = self.tailer.backlog() > 0
+            if catching_up:
+                self._show_progress(self.tailer.pos or 0, self.tailer.size)
+            else:
+                self._hide_progress()
+                self._update_status(path, len(lines))
         except Exception as exc:
             self.lbl_status.config(text=f"error: {exc}")
-        self._redraw()
-        self.root.after(REFRESH_MS, self._tick)
+
+        if catching_up:
+            # Chew through the backlog in quick small bites; redraw only every
+            # few chunks so drawing doesn't slow the load down.
+            self._skip_draws = (self._skip_draws + 1) % 5
+            if self._skip_draws == 0:
+                self._redraw()
+            self.root.after(CATCHUP_MS, self._tick)
+        else:
+            self._redraw()
+            self.root.after(REFRESH_MS, self._tick)
 
     def _update_status(self, path, n_new):
         if not path:

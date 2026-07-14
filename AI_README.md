@@ -27,14 +27,17 @@ Midnight; see git history if you need it.)
 ## How it works — data flow
 
 ```
-Tailer.poll()            -> reads new bytes from the newest WoWCombatLog-*.txt
+Tailer.poll()            -> reads new bytes (<= READ_CHUNK per poll) from the
+                            newest WoWCombatLog-*.txt; backlog() = bytes left
+  quick_event(line)      -> cheap event-name peek; drops non-INTERESTING lines
   parse_line(line)       -> (timestamp, [csv fields])  or None
     Meter.feed(ts,fields)-> attributes damage / tracks deaths
       Segment(current)   -> the current fight (resets after 5s idle)
       Segment(overall)   -> the whole session
       Meter.incoming[]   -> per-player rolling buffer of damage TAKEN
       Meter.deaths[]     -> DeathRecord snapshots on UNIT_DIED
-TrackMeUI._tick()        -> every 1s: poll, feed, redraw (Tk after-loop)
+TrackMeUI._tick()        -> every 1s (or every CATCHUP_MS while a backlog
+                            exists, with a progress strip + throttled redraws)
 ```
 
 - **Tailer** follows the *newest* `WoWCombatLog*.txt` in the Logs folder (Midnight
@@ -218,6 +221,17 @@ These are verified against a real log — don't "fix" them back to textbook valu
 11. **Never `reset()` a Segment that may be archived in `meter.fights`** —
    `reset()` mutates in place via `__init__`; replace the object instead
    (`self.current = Segment()`).
+12. **New event types must be added to `INTERESTING_EVENTS`.** `_tick` drops
+   every line whose event isn't in that set via `quick_event()` *before*
+   parsing (perf: skips the aura/heal spam that is most of a log). If you teach
+   `Meter.feed()` a new event but forget the set, it will never arrive at
+   runtime — while tests that call `feed()` directly still pass. Add to both.
+13. **Startup load must stay chunked.** The Tailer reads at most `READ_CHUNK`
+   bytes per poll and `_tick` reschedules at `CATCHUP_MS` while
+   `tailer.backlog() > 0`, showing the progress strip. A 15 MB log parsed in
+   one Tk callback froze the UI for ~4s — don't regress to `f.read()`
+   unbounded. `parse_timestamp` caches epoch per whole second (`_TS_CACHE`);
+   strptime-per-line was the hottest path.
 9. **Environment note (not a code trap):** on this user's install, merely
    registering combat-log events surfaced a Blizzard Edit Mode
    `BT4BarExtraActionBar SetPoint` error caused by a stale Bartender4 anchor in
