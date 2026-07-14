@@ -20,8 +20,9 @@ chat text is wrapped in "Secret Values" addons can't read. The official
 replacement `C_DamageMeter` gives total/DPS/overkill/pet but **not**
 crit/non-crit, hit count, cast count, or biggest hit. That detail only survives
 in the on-disk log written by `/combatlog` — readable only by an out-of-game
-tool. So TrackMe pivoted from an addon to this app. The old `TrackMe.lua` /
-`TrackMe.toc` are kept for reference but are a dead end on Midnight.
+tool. So TrackMe pivoted from an addon to this app. (The original in-game addon,
+`TrackMe.lua`/`TrackMe.toc`, was removed from the repo — it's a dead end on
+Midnight; see git history if you need it.)
 
 ## How it works — data flow
 
@@ -231,14 +232,15 @@ py trackme.py "D:\path\to\Logs" Name   # explicit folder + character
 py test_parse.py                       # regression test (parser + deaths)
 ```
 
-Double-click launchers: **`TrackMe.vbs`** runs the app with **no console window**
-(WScript runs `pyw` — the windowless Python launcher — hidden; this is the one to
-hand the user). **`TrackMe.bat`** runs it *with* a console (handy for seeing
-errors) — both `cd /d "%~dp0"`. **`Test.bat`** runs the regression tests and
-pauses. A `.bat` always flashes a console; only `wscript`/`pyw` avoids it — don't
-"fix" the no-console launcher back into a `.bat`.
+Launcher: **`TrackMe.vbs`** is the only launcher — it runs the app with **no
+console window** (WScript runs `pyw`, the windowless Python launcher, hidden).
+`cd`s to its own folder so it works from anywhere. A `.bat` would always flash a
+console; only `wscript`/`pyw` avoids it — if you re-add a debug launcher, keep it
+separate and don't turn the no-console path into a `.bat`.
 
-Use `py`, not `python` (Windows Store stub). `test_parse.py` builds lines in the
+Dependencies: **stdlib only, nothing to `pip install`** — needs Python 3 with
+Tkinter and the `py`/`pyw` launcher (official Windows installer: "py launcher" +
+"tcl/tk and IDLE"). See README "Requirements". Use `py`, not `python` (Store stub). `test_parse.py` builds lines in the
 real Midnight format and asserts both the damage parse and a death snapshot
 (window filtering, chronological order, overkill = fatal blow). Run it after any
 parser change. The Tk UI isn't unit-tested — smoke-check with `py -c "import

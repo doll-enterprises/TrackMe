@@ -13,23 +13,51 @@ an in-game addon **cannot** compute per-spell crit/hit/average/biggest anymore.
 WoW still writes the full detail to disk via `/combatlog`
 (`WoWCombatLog.txt`). This app tails that file live and renders the breakdown.
 
+## Requirements
+
+The app uses **only the Python standard library — there is nothing to
+`pip install`.** You just need Python with Tkinter and the `py`/`pyw` launcher,
+which the official Windows installer includes by default.
+
+On most Windows machines this is already present. To install it fresh:
+
+1. Download Python from <https://www.python.org/downloads/windows/> (the
+   official installer — **not** the Microsoft Store version).
+2. Run the installer and make sure these are enabled (both are on by default):
+   - ✅ **py launcher** — installs `py` and `pyw` (the windowless launcher the
+     `.vbs` uses).
+   - ✅ **tcl/tk and IDLE** (under *Optional Features*) — this is Tkinter, the
+     entire GUI.
+3. Verify in a terminal — both commands should succeed:
+
+   ```
+   pyw --version
+   py -c "import tkinter; print('tkinter OK')"
+   ```
+
+Windows Script Host (`wscript.exe`), which runs the `.vbs` launcher, is built
+into Windows — nothing to install for that.
+
+> Troubleshooting: if `TrackMe.vbs` does nothing, re-run the Python installer →
+> **Modify** and enable **py launcher** (if `pyw` is missing) and/or **tcl/tk
+> and IDLE** (if the window flashes and vanishes — that means Tkinter is
+> missing, common with Microsoft Store Python).
+
 ## Setup
 
 1. **In game, once per session:** type `/combatlog` to start writing the log.
    (Type it again to stop.) Advanced Combat Logging is optional — plain logging
    already includes damage, crit and spell info.
-2. **Run the app** (Python 3, uses only the standard library / Tkinter).
-   Double-click **`TrackMe.vbs`** — it opens just the app window, with **no
-   command-prompt window** alongside it. (Prefer `TrackMe.bat` when you want to
-   see console output for troubleshooting.) Or from a terminal:
+2. **Run the app.** Double-click **`TrackMe.vbs`** — it opens just the app
+   window, with **no command-prompt window** alongside it. Or from a terminal:
 
    ```
    py trackme.py
    ```
 
    Note: use `py`, not `python` — on Windows `python` may be a Microsoft Store
-   stub that isn't the real interpreter. `TrackMe.bat`/`TrackMe.vbs` do this for
-   you (`.vbs` uses `pyw`, the windowless launcher).
+   stub that isn't the real interpreter. `TrackMe.vbs` uses `pyw`, the
+   windowless launcher, for you.
 
    By default it watches the WoW `Logs` folder and follows the **newest**
    `WoWCombatLog-*.txt` (Midnight writes a fresh timestamped file each session).
@@ -74,8 +102,6 @@ WoW still writes the full detail to disk via `/combatlog`
   this session shows immediately; it then follows new lines live.
 - Updates arrive in small bursts — WoW flushes the log file every few seconds, so
   "live" has a second or two of latency. That's a client behavior, not the app.
-- `trackme.py` is the app. `test_parse.py` is a regression test for the log
-  parser and the death snapshot — run it with `py test_parse.py`, or just
-  double-click **`Test.bat`** (it pauses so you can read the result).
-- `TrackMe.lua` / `TrackMe.toc` are the original in-game addon, kept for
-  reference — they can't provide the crit/hit detail on Midnight (see above).
+- `trackme.py` is the app; `TrackMe.vbs` is the launcher. `test_parse.py` is a
+  regression test for the log parser and the death snapshot — run it with
+  `py test_parse.py`.
